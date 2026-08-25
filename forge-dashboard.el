@@ -328,21 +328,42 @@ The returned plist contains no rendered text or buffer state."
       (kill-new url)
       (message "Copied %s" url))))
 
+(defun forge-dashboard--pull-selective (repo rest buffer)
+  "Pull selective REPO, then continue with REST in dashboard BUFFER.
+Forge's GitHub and GitLab methods do not invoke their callback for selective
+repositories, so use their post-storage message as the completion signal."
+  (let (completion)
+    (setq completion
+          (lambda (pulled _echo done format &rest _args)
+            (when (and (eq pulled repo)
+                       done
+                       (equal format "Storing REPO"))
+              (advice-remove 'forge--msg completion)
+              (forge-dashboard--pull-repositories rest buffer))))
+    (advice-add 'forge--msg :after completion)
+    (condition-case err
+        (forge--pull repo)
+      (error
+       (advice-remove 'forge--msg completion)
+       (signal (car err) (cdr err))))))
+
 (defun forge-dashboard--pull-repositories (repos buffer)
   "Pull REPOS sequentially, then refresh dashboard BUFFER.
-Forge API-backed pulls invoke their callback after storing data.  Forge
-classes without a topic API complete synchronously for this purpose."
+Forge API-backed pulls invoke their callback after storing data, except for
+selective repositories.  Classes without a topic API complete synchronously."
   (when (buffer-live-p buffer)
     (if-let* ((repo (car repos)))
         (let ((next (lambda ()
                       (forge-dashboard--pull-repositories (cdr repos) buffer))))
           (with-current-buffer buffer
-            (if (or (cl-typep repo 'forge-noapi-repository)
-                    (cl-typep repo 'forge-unusedapi-repository))
-                (progn
-                  (forge--pull repo)
-                  (funcall next))
-              (forge--pull repo next))))
+            (cond ((or (cl-typep repo 'forge-noapi-repository)
+                       (cl-typep repo 'forge-unusedapi-repository))
+                   (forge--pull repo)
+                   (funcall next))
+                  ((oref repo selective-p)
+                   (forge-dashboard--pull-selective repo (cdr repos) buffer))
+                  (t
+                   (forge--pull repo next)))))
       (with-current-buffer buffer
         (magit-refresh)))))
 

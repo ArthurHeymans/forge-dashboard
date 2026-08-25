@@ -8,6 +8,16 @@
 (require 'forge-issue)
 (require 'forge-pullreq)
 
+(defclass forge-dashboard-test-repository ()
+  ((owner :initarg :owner)
+   (name :initarg :name)
+   (selective-p :initarg :selective-p :initform nil)))
+
+(defun forge-dashboard-test--repository (name &optional selective)
+  "Make a synthetic repository named NAME with SELECTIVE pull behavior."
+  (forge-dashboard-test-repository
+   :owner "owner" :name name :selective-p selective))
+
 (defun forge-dashboard-test--issue (&rest slots)
   "Make a synthetic issue initialized with SLOTS."
   (apply #'forge-issue
@@ -132,9 +142,35 @@
     (should (eq browsed topic))
     (should (equal copied "https://example.test/topic"))))
 
+(ert-deftest forge-dashboard-selective-pull-waits-for-storage-and-continues ()
+  (let* ((first (forge-dashboard-test--repository "first" t))
+         (second (forge-dashboard-test--repository "second"))
+         calls callback
+         (refreshes 0))
+    (cl-letf (((symbol-function 'forge-dashboard--dashboard-repositories)
+               (lambda () (list first second)))
+              ((symbol-function 'forge--pull)
+               (lambda (repo &optional supplied-callback &rest _)
+                 (push repo calls)
+                 ;; Match Forge: selective GitHub/GitLab pulls omit CALLBACK.
+                 (unless (oref repo selective-p)
+                   (setq callback supplied-callback))))
+              ((symbol-function 'magit-refresh)
+               (lambda () (cl-incf refreshes))))
+      (forge-dashboard-pull)
+      (should (equal (reverse calls) (list first)))
+      (should-not callback)
+      (should (zerop refreshes))
+      (forge--msg first nil t "Storing REPO")
+      (should (equal (reverse calls) (list first second)))
+      (should callback)
+      (should (zerop refreshes))
+      (funcall callback)
+      (should (= refreshes 1)))))
+
 (ert-deftest forge-dashboard-pulls-sequentially-before-refresh ()
-  (let* ((first (forge-dashboard-test--issue :id "first"))
-         (second (forge-dashboard-test--issue :id "second"))
+  (let* ((first (forge-dashboard-test--repository "first"))
+         (second (forge-dashboard-test--repository "second"))
          calls callbacks
          (refreshes 0))
     (cl-letf (((symbol-function 'forge-dashboard--dashboard-repositories)
