@@ -16,10 +16,12 @@ check: clean compile test
 
 compile:
 	$(BATCH) --eval '(setq byte-compile-error-on-warn t)' \
-	  -f batch-byte-compile forge-dashboard.el test/forge-dashboard-test.el
+	  -f batch-byte-compile forge-dashboard-triage.el forge-dashboard.el \
+	  test/forge-dashboard-test.el
 
 test:
 	$(BATCH) -l test/forge-dashboard-test.el -f ert-run-tests-batch-and-exit
 
 clean:
-	rm -f forge-dashboard.elc test/forge-dashboard-test.elc
+	rm -f forge-dashboard-triage.elc forge-dashboard.elc \
+	  test/forge-dashboard-test.elc

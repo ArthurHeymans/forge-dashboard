@@ -4,6 +4,7 @@
 
 (require 'ert)
 (require 'forge-dashboard)
+(require 'forge-dashboard-triage)
 (require 'forge-discussion)
 (require 'forge-issue)
 (require 'forge-pullreq)
@@ -167,6 +168,75 @@
       (should (zerop refreshes))
       (funcall callback)
       (should (= refreshes 1)))))
+
+(ert-deftest forge-dashboard-attention-classifies-each-state ()
+  (let ((forge-dashboard-stale-after 14)
+        (forge-dashboard-awaiting-review-after 7))
+    (should (eq (forge-dashboard-attention-state
+                 '(:kind pullreq :mine t :approvals 1
+                   :review-states (approved) :draft nil
+                   :merge-conflict nil :ci failed :activity-age 1))
+                'ready-to-merge))
+    (should (eq (forge-dashboard-attention-state
+                 '(:kind pullreq :mine t
+                   :review-states (changes-requested) :activity-age 1))
+                'changes-requested))
+    (should (eq (forge-dashboard-attention-state
+                 '(:mine t :last-comment-mine nil :status unread
+                   :activity-age 1))
+                'they-replied))
+    (should (eq (forge-dashboard-attention-state
+                 '(:kind pullreq :review-requested t :reviewed-by-me nil
+                   :activity-age 1))
+                'review-requested))
+    (should (eq (forge-dashboard-attention-state
+                 '(:kind pullreq :mine t :review-age 7 :activity-age 7))
+                'awaiting-review))
+    (should (eq (forge-dashboard-attention-state '(:activity-age 15))
+                'stale))
+    (should (eq (forge-dashboard-attention-state '(:snoozed t)) 'snoozed))))
+
+(ert-deftest forge-dashboard-ready-ignores-ci-but-degrades-missing-data ()
+  (let ((base '(:kind pullreq :mine t :approvals 1
+                :review-states (approved) :draft nil
+                :merge-conflict nil :activity-age 1)))
+    (should (eq (forge-dashboard-attention-state
+                 (append base '(:ci failed)))
+                'ready-to-merge))
+    (should (eq (forge-dashboard-attention-state base) 'ready-to-merge))
+    (should-not (forge-dashboard-attention-state
+                 '(:kind pullreq :mine t :approvals 1 :draft nil
+                   :merge-conflict nil :activity-age 1)))
+    (should-not (forge-dashboard-attention-state
+                 '(:kind pullreq :mine t :approvals 1
+                   :review-states (approved) :draft nil :activity-age 1)))))
+
+(ert-deftest forge-dashboard-urgency-orders-state-then-age ()
+  (let* ((stale '(:state stale :age 100))
+         (blocked-young '(:state review-requested :age 1))
+         (blocked-old '(:state changes-requested :age 10))
+         (ready '(:state ready-to-merge :age 0)))
+    (should (equal (forge-dashboard-sort-attention
+                    (list stale blocked-young ready blocked-old))
+                   (list ready blocked-old blocked-young stale)))))
+
+(ert-deftest forge-dashboard-snooze-store-round-trip ()
+  (let ((forge-dashboard-triage-file ":memory:")
+        (now (date-to-time "2025-01-01T00:00:00Z")))
+    (unwind-protect
+        (progn
+          (forge-dashboard-triage-open-store ":memory:")
+          (forge-dashboard-triage-snooze
+           "topic" (time-add now (days-to-time 1)))
+          (should (forge-dashboard-triage-snoozed-p "topic" now))
+          (should-not (forge-dashboard-triage-snoozed-p
+                       "topic" (time-add now (days-to-time 2))))
+          (forge-dashboard-triage-done "topic" "2025-01-02T00:00:00Z")
+          (should (forge-dashboard-triage-done-p
+                   "topic" "2025-01-02T00:00:00Z"))
+          (should-not (forge-dashboard-triage-done-p
+                       "topic" "2025-01-03T00:00:00Z")))
+      (forge-dashboard-triage-close-store))))
 
 (ert-deftest forge-dashboard-pulls-sequentially-before-refresh ()
   (let* ((first (forge-dashboard-test--repository "first"))
