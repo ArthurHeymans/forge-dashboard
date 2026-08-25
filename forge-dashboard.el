@@ -116,20 +116,6 @@ The returned plist contains no rendered text or buffer state."
   (forge--topics-spec :type type :active nil :state 'open :status nil
                       :order 'recently-updated :limit nil))
 
-(defun forge-dashboard--repo-topics (repo)
-  "Return selected open topics for REPO, newest activity first."
-  (let ((types (pcase forge-dashboard-topic-type
-                 ('pr '(pullreq))
-                 ('issue '(issue))
-                 (_ '(issue pullreq)))))
-    (sort (mapcan (lambda (type)
-                    (forge--list-topics (forge-dashboard--topic-spec type)
-                                        repo type))
-                  types)
-          (lambda (left right)
-            (string> (or (oref left updated) "")
-                     (or (oref right updated) ""))))))
-
 (defun forge-dashboard--repo-data (repo)
   "Compute counts and selected topic objects for REPO."
   (let* ((issues (forge--list-topics (forge-dashboard--topic-spec 'issue)
@@ -195,7 +181,7 @@ The returned plist contains no rendered text or buffer state."
          (row-face (pcase status
                      ('unread 'forge-topic-slug-unread)
                      ('pending 'forge-dashboard-pending))))
-    (magit-insert-section ((eieio-object-class topic) topic)
+    (magit-insert-section ((eval (oref topic closql-table)) topic t)
       (insert
        (propertize
         (format "#%-5d %-48s %-5s @%-16s "
@@ -334,13 +320,30 @@ The returned plist contains no rendered text or buffer state."
       (kill-new url)
       (message "Copied %s" url))))
 
+(defun forge-dashboard--pull-repositories (repos buffer)
+  "Pull REPOS sequentially, then refresh dashboard BUFFER.
+Forge API-backed pulls invoke their callback after storing data.  Forge
+classes without a topic API complete synchronously for this purpose."
+  (when (buffer-live-p buffer)
+    (if-let* ((repo (car repos)))
+        (let ((next (lambda ()
+                      (forge-dashboard--pull-repositories (cdr repos) buffer))))
+          (with-current-buffer buffer
+            (if (or (cl-typep repo 'forge-noapi-repository)
+                    (cl-typep repo 'forge-unusedapi-repository))
+                (progn
+                  (forge--pull repo)
+                  (funcall next))
+              (forge--pull repo next))))
+      (with-current-buffer buffer
+        (magit-refresh)))))
+
 (defun forge-dashboard-pull ()
-  "Pull Forge data for each repository represented by the dashboard."
+  "Pull Forge data for each dashboard repository sequentially."
   (interactive)
-  (dolist (repo (forge-dashboard--dashboard-repositories))
-    (let ((forge-buffer-repository (oref repo id)))
-      (call-interactively #'forge-pull)))
-  (magit-refresh))
+  (forge-dashboard--pull-repositories
+   (forge-dashboard--dashboard-repositories)
+   (current-buffer)))
 
 (defun forge-dashboard-toggle-owned ()
   "Toggle the owned-repositories section."
