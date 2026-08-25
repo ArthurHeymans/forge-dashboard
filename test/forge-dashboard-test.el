@@ -4,6 +4,7 @@
 
 (require 'ert)
 (require 'forge-dashboard)
+(require 'forge-discussion)
 (require 'forge-issue)
 (require 'forge-pullreq)
 
@@ -25,12 +26,59 @@
     (should (eq (plist-get row :status) 'unread))
     (should (= (plist-get row :age) 10))))
 
+(ert-deftest forge-dashboard-topic-row-recognizes-discussion ()
+  (let ((topic (forge-discussion
+                :id "discussion-id" :repository "repo-id" :number 3
+                :state 'open :author "hubot" :title "What do you think?"
+                :created "2025-01-01T00:00:00Z"
+                :updated "2025-01-03T00:00:00Z" :status 'unread)))
+    (should (equal (plist-get (forge-dashboard--topic-row topic) :type)
+                   "discussion"))))
+
+(ert-deftest forge-dashboard-repo-data-includes-discussions ()
+  (let* ((discussion (forge-discussion
+                      :id "discussion-id" :repository "repo-id" :number 3
+                      :state 'open :author "hubot" :title "Discuss"
+                      :created "2025-01-01T00:00:00Z"
+                      :updated "2025-01-12T00:00:00Z" :status 'unread))
+         (issue (forge-dashboard-test--issue :updated "2025-01-11T00:00:00Z"))
+         (pullreq (forge-pullreq
+                   :id "pr-id" :repository "repo-id" :number 7 :state 'open
+                   :author "hubot" :title "Ship it"
+                   :created "2025-01-01T00:00:00Z"
+                   :updated "2025-01-10T00:00:00Z" :status 'done))
+         (forge-dashboard-topic-type 'all)
+         calls)
+    (cl-letf (((symbol-function 'forge--list-topics)
+               (lambda (spec _repo type)
+                 (push (cons (oref spec type) type) calls)
+                 (pcase type
+                   ('discussion (list discussion))
+                   ('issue (list issue))
+                   ('pullreq (list pullreq))))))
+      (let ((data (forge-dashboard--repo-data issue)))
+        (should (equal (plist-get data :topics)
+                       (list discussion issue pullreq)))
+        (should (= (plist-get data :open-issues) 1))
+        (should (= (plist-get data :open-pullreqs) 1))
+        (should (= (plist-get data :unread) 1))
+        (should (equal (nreverse calls)
+                       '((discussion . discussion)
+                         (issue . issue)
+                         (pullreq . pullreq))))))))
+
 (ert-deftest forge-dashboard-topic-row-recognizes-pull-request ()
   (let ((topic (forge-pullreq
                 :id "pr-id" :repository "repo-id" :number 7 :state 'open
                 :author "hubot" :title "Ship it" :created "2025-01-01T00:00:00Z"
                 :updated "2025-01-02T00:00:00Z" :status 'pending)))
     (should (equal (plist-get (forge-dashboard--topic-row topic) :type) "PR"))))
+
+(ert-deftest forge-dashboard-unread-face-is-red-and-bold ()
+  (should (eq (face-attribute 'forge-dashboard-unread :inherit nil t)
+              'forge-topic-slug-unread))
+  (should (equal (face-attribute 'forge-dashboard-unread :foreground nil t)
+                 "red")))
 
 (ert-deftest forge-dashboard-age-ramp-boundaries ()
   (let ((forge-dashboard-stale-after 14))

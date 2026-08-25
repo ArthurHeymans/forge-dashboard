@@ -38,6 +38,11 @@
   :type 'natnum
   :group 'forge-dashboard)
 
+(defface forge-dashboard-unread
+  '((t :inherit forge-topic-slug-unread :foreground "red"))
+  "Face used for unread topic rows."
+  :group 'forge-dashboard)
+
 (defface forge-dashboard-pending
   '((t :inherit warning :foreground "orange"))
   "Face used for pending topic rows."
@@ -118,11 +123,14 @@ The returned plist contains no rendered text or buffer state."
 
 (defun forge-dashboard--repo-data (repo)
   "Compute counts and selected topic objects for REPO."
-  (let* ((issues (forge--list-topics (forge-dashboard--topic-spec 'issue)
+  (let* ((discussions
+          (forge--list-topics (forge-dashboard--topic-spec 'discussion)
+                              repo 'discussion))
+         (issues (forge--list-topics (forge-dashboard--topic-spec 'issue)
                                      repo 'issue))
          (pullreqs (forge--list-topics (forge-dashboard--topic-spec 'pullreq)
                                        repo 'pullreq))
-         (all (append issues pullreqs))
+         (all (append discussions issues pullreqs))
          (topics (pcase forge-dashboard-topic-type
                    ('pr pullreqs)
                    ('issue issues)
@@ -179,7 +187,7 @@ The returned plist contains no rendered text or buffer state."
          (age (plist-get row :age))
          (status (plist-get row :status))
          (row-face (pcase status
-                     ('unread 'forge-topic-slug-unread)
+                     ('unread 'forge-dashboard-unread)
                      ('pending 'forge-dashboard-pending))))
     (magit-insert-section ((eval (oref topic closql-table)) topic t)
       (insert
@@ -364,7 +372,7 @@ classes without a topic API complete synchronously for this purpose."
   (magit-refresh))
 
 (defun forge-dashboard-show-all ()
-  "Show issues and pull requests."
+  "Show discussions, issues, and pull requests."
   (interactive)
   (forge-dashboard-set-type 'all))
 
