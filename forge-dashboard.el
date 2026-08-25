@@ -14,6 +14,7 @@
 (require 'forge)
 (require 'forge-commands)
 (require 'forge-topics)
+(require 'forge-dashboard-triage)
 (require 'magit-section)
 (require 'seq)
 (require 'subr-x)
@@ -269,6 +270,11 @@ The returned plist contains no rendered text or buffer state."
   "y" #'forge-dashboard-copy-url
   "g" #'magit-refresh
   "G" #'forge-dashboard-pull
+  "t" #'forge-dashboard-triage
+  "z" #'forge-dashboard-snooze
+  "d" #'forge-dashboard-done
+  "C" #'forge-dashboard-nudge
+  "M" #'forge-dashboard-merge
   "?" #'forge-dashboard-menu)
 
 (define-derived-mode forge-dashboard-mode magit-mode "Forge Dashboard"
@@ -277,12 +283,99 @@ The returned plist contains no rendered text or buffer state."
   (setq-local default-directory "/")
   (setq-local forge-buffer-unassociated-p t))
 
+(defun forge-dashboard--attention-items (repos &optional now)
+  "Return urgency-sorted attention items for REPOS at NOW."
+  (forge-dashboard-sort-attention
+   (seq-keep
+    (lambda (topic) (forge-dashboard-triage-item topic now))
+    (mapcan
+     (lambda (repo)
+       (let ((forge-dashboard-topic-type 'all))
+         (copy-sequence (plist-get (forge-dashboard--repo-data repo) :topics))))
+     repos))))
+
+(defun forge-dashboard--ci-badge (ci)
+  "Return an informational badge for CI."
+  (pcase ci ('success "CI ✓") ('failed "CI ✗") (_ "CI ?")))
+
+(defun forge-dashboard--attention-reason (item)
+  "Return the human-readable reason for attention ITEM."
+  (let ((age (plist-get item :age)))
+    (pcase (plist-get item :state)
+      ('changes-requested "changes requested")
+      ('they-replied "they replied")
+      ('review-requested "review requested")
+      ('awaiting-review (format "awaiting review %dd" age))
+      ('stale (format "stale %dd" age)))))
+
+(defun forge-dashboard--attention-ball (state)
+  "Return the ball label for attention STATE."
+  (pcase state
+    ((or 'changes-requested 'they-replied 'review-requested) "on me")
+    ('awaiting-review "→ nudge?")
+    ('stale "decide")))
+
+(defun forge-dashboard--insert-attention-item (item ready)
+  "Insert attention ITEM, using the READY row format when non-nil."
+  (let* ((topic (plist-get item :topic))
+         (data (plist-get item :data))
+         (repo (or (plist-get data :repo) "unknown")))
+    (magit-insert-section ((eval (oref topic closql-table)) topic t)
+      (if ready
+          (insert (format "✅ %-24s #%-5d %-45s %d approval%s  %s  M to merge\n"
+                          repo (oref topic number)
+                          (truncate-string-to-width (oref topic title) 45 nil nil t)
+                          (plist-get data :approvals)
+                          (if (= (plist-get data :approvals) 1) "" "s")
+                          (forge-dashboard--ci-badge (plist-get data :ci))))
+        (let ((state (plist-get item :state)))
+          (insert (format "%s %-24s #%-5d %-45s %-20s %-9s %dd\n"
+                          (if (memq state '(changes-requested they-replied
+                                            review-requested))
+                              "⛔" "⏳")
+                          repo (oref topic number)
+                          (truncate-string-to-width (oref topic title) 45 nil nil t)
+                          (forge-dashboard--attention-reason item)
+                          (forge-dashboard--attention-ball state)
+                          (plist-get item :age))))))))
+
+(defun forge-dashboard--insert-attention (items)
+  "Insert ready and needs-attention sections from ITEMS."
+  (let ((ready (seq-filter
+                (lambda (item)
+                  (eq (plist-get item :state) 'ready-to-merge))
+                items))
+        (needs (seq-remove
+                (lambda (item)
+                  (eq (plist-get item :state) 'ready-to-merge))
+                items)))
+    (magit-insert-section (forge-dashboard-ready)
+      (magit-insert-heading "Ready to merge")
+      (if ready
+          (dolist (item ready)
+            (forge-dashboard--insert-attention-item item t))
+        (insert "Nothing ready to merge\n")))
+    (magit-insert-section (forge-dashboard-attention)
+      (magit-insert-heading "Needs attention")
+      (if needs
+          (dolist (item needs)
+            (forge-dashboard--insert-attention-item item nil))
+        (insert "Nothing needs attention\n")))))
+
 (defun forge-dashboard-refresh-buffer ()
   "Render the Forge dashboard from the local database."
-  (let ((repos (forge-dashboard--tracked-repositories)))
+  (let* ((repos (forge-dashboard--tracked-repositories))
+         (dashboard-repos
+          (seq-filter
+           (lambda (repo)
+             (or (forge-dashboard--owned-owner-p (oref repo owner))
+                 (member (oref repo owner) forge-dashboard-organizations)))
+           repos))
+         (attention (forge-dashboard--attention-items dashboard-repos)))
     (magit-insert-section (forge-dashboard)
       (insert (propertize "Forge Dashboard" 'face 'bold)
               (format "  updated %s\n\n" (forge-dashboard--updated-label)))
+      (forge-dashboard--insert-attention attention)
       (when forge-dashboard-show-owned
         (forge-dashboard--insert-owned repos))
       (when forge-dashboard-show-organizations
@@ -317,6 +410,14 @@ The returned plist contains no rendered text or buffer state."
         ((forge-repository-at-point)
          (forge-browse-repository (forge-repository-at-point)))
         (t (user-error "No topic or repository at point"))))
+
+(defun forge-dashboard-triage ()
+  "Start linear triage over the current dashboard attention queue."
+  (interactive)
+  (forge-dashboard-triage-start
+   (forge-dashboard--attention-items
+    (forge-dashboard--dashboard-repositories))
+   (current-buffer)))
 
 (defun forge-dashboard-copy-url ()
   "Copy the URL of the topic or repository at point."
