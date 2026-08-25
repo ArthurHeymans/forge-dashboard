@@ -172,7 +172,7 @@ Absent host data does not satisfy rules that depend on that datum.  DATA uses
           ((or 'awaiting-review 'stale) 1)
           (_ 0))
         1000000)
-     (max 0 (or age 0))))
+     (- (max 0 (or age 0)))))
 
 (defun forge-dashboard-sort-attention (items)
   "Return a copy of attention ITEMS sorted by urgency.
@@ -263,7 +263,7 @@ in slots like `review-requests', and EIEIO objects with a login slot."
                                       (forge-dashboard-triage--review-author review)))
                              reviews))
            :activity-age age :review-age age :updated updated
-           :repo (and repo (forge-dashboard-triage--slot repo 'slug)))
+           :repo (and repo (ignore-errors (oref repo slug))))
      (when last-post
        (list :last-comment-mine
              (and me (equal me (forge-dashboard-triage--slot

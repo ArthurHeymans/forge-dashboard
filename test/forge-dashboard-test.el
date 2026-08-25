@@ -12,17 +12,19 @@
 (defclass forge-dashboard-test-repository ()
   ((owner :initarg :owner)
    (name :initarg :name)
+   (slug :initarg :slug)
    (selective-p :initarg :selective-p :initform nil)))
 
 (defun forge-dashboard-test--repository (name &optional selective)
   "Make a synthetic repository named NAME with SELECTIVE pull behavior."
   (forge-dashboard-test-repository
-   :owner "owner" :name name :selective-p selective))
+   :owner "owner" :name name :slug (format "owner/%s" name)
+   :selective-p selective))
 
 (defun forge-dashboard-test--issue (&rest slots)
   "Make a synthetic issue initialized with SLOTS."
   (apply #'forge-issue
-         :id "issue-id" :repository "repo-id" :number 12 :state 'open
+         :id "issue-id" :repository "repo-id" :number 12 :slug "#12" :state 'open
          :author "octocat" :title "Triage this" :created "2025-01-01T00:00:00Z"
          :updated "2025-01-10T00:00:00Z" :status 'done
          slots))
@@ -70,6 +72,7 @@
       (let ((data (forge-dashboard--repo-data issue)))
         (should (equal (plist-get data :topics)
                        (list discussion issue pullreq)))
+        (should (= (plist-get data :open-topics) 3))
         (should (= (plist-get data :open-issues) 1))
         (should (= (plist-get data :open-pullreqs) 1))
         (should (= (plist-get data :unread) 1))
@@ -90,6 +93,14 @@
               'forge-topic-slug-unread))
   (should (equal (face-attribute 'forge-dashboard-unread :foreground nil t)
                  "red")))
+
+(ert-deftest forge-dashboard-unread-badge-is-explicit-and-aligned ()
+  (let ((unread (forge-dashboard--unread-badge 'unread))
+        (done (forge-dashboard--unread-badge 'done)))
+    (should (equal (substring-no-properties unread) "[NEW] "))
+    (should (eq (get-text-property 0 'font-lock-face unread)
+                'forge-dashboard-unread))
+    (should (= (string-width unread) (string-width done)))))
 
 (ert-deftest forge-dashboard-age-ramp-boundaries ()
   (let ((forge-dashboard-stale-after 14))
@@ -129,6 +140,69 @@
   ;; Owned wins over member when both match.
   (should (eq (forge-dashboard--classification "me" "me" nil '("me") t)
               'owned)))
+
+(ert-deftest forge-dashboard-active-repo-data-hides-empty-repositories ()
+  (let ((active (forge-dashboard-test--repository "active"))
+        (empty (forge-dashboard-test--repository "empty")))
+    (cl-letf (((symbol-function 'forge-dashboard--repo-data)
+               (lambda (repo)
+                 (list :repo repo :open-topics
+                       (if (equal (oref repo name) "active") 1 0)))))
+      (should (equal (forge-dashboard--active-repo-data (list active empty))
+                     (list (list :repo active :open-topics 1)))))))
+
+(ert-deftest forge-dashboard-repository-heading-hides-zero-counts ()
+  (let* ((repo (forge-dashboard-test--repository "colorful"))
+         (plain (substring-no-properties
+                 (forge-dashboard--repository-heading
+                  (list :repo repo :open-pullreqs 0 :open-issues 0 :unread 0))))
+         (active (substring-no-properties
+                  (forge-dashboard--repository-heading
+                   (list :repo repo :open-pullreqs 2 :open-issues 0 :unread 1)))))
+    (should (equal plain "owner/colorful"))
+    (should (eq (get-text-property
+                 0 'font-lock-face
+                 (forge-dashboard--repository-heading
+                  (list :repo repo :open-pullreqs 0 :open-issues 0 :unread 0)))
+                'bold))
+    (should (equal active "owner/colorful  2 PR  1 unread"))))
+
+(ert-deftest forge-dashboard-repositories-are-collapsed-with-all-topics ()
+  (let ((repo (forge-dashboard-test--repository "compact"))
+        (topic (forge-dashboard-test--issue))
+        (forge-dashboard-topics-per-repo nil))
+    (with-temp-buffer
+      (forge-dashboard-mode)
+      (let ((inhibit-read-only t))
+        (magit-insert-section (forge-dashboard-test-root)
+          (forge-dashboard--insert-repository
+           (list :repo repo :topics (list topic)
+                 :open-pullreqs 0 :open-issues 1 :unread 0)
+           1)))
+      (goto-char (point-min))
+      (let ((section (magit-current-section)))
+        (should (eq (oref section type) 'forge-repo))
+        (should (oref section hidden))
+        (should (string-match-p
+                 "^  owner/compact  1 issue$"
+                 (buffer-substring-no-properties (point-min) (point-max))))
+        (should-not (string-match-p
+                     "Triage this"
+                     (buffer-substring-no-properties (point-min) (point-max))))
+        (magit-section-show section)
+        (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+          (should (string-match-p "^          #12.*Triage this" text))
+          (should-not (string-match-p "more" text)))))))
+
+(ert-deftest forge-dashboard-remaps-prompting-browse-commands ()
+  (with-temp-buffer
+    (forge-dashboard-mode)
+    (dolist (command '(magit-browse-thing forge-browse-topic
+                       forge-browse-discussion forge-browse-issue
+                       forge-browse-pullreq))
+      (should (eq (command-remapping command) 'forge-dashboard-browse)))
+    (should (eq (key-binding (kbd "b")) 'forge-dashboard-browse))
+    (should (eq (key-binding (kbd "o")) 'forge-dashboard-browse))))
 
 (ert-deftest forge-dashboard-topic-section-dispatches-actions ()
   (let ((topic (forge-dashboard-test--issue))
@@ -225,14 +299,14 @@
                  '(:kind pullreq :mine t :approvals 1
                    :review-states (approved) :draft nil :activity-age 1)))))
 
-(ert-deftest forge-dashboard-urgency-orders-state-then-age ()
+(ert-deftest forge-dashboard-urgency-orders-state-then-recency ()
   (let* ((stale '(:state stale :age 100))
-         (blocked-young '(:state review-requested :age 1))
+         (blocked-recent '(:state review-requested :age 1))
          (blocked-old '(:state changes-requested :age 10))
          (ready '(:state ready-to-merge :age 0)))
     (should (equal (forge-dashboard-sort-attention
-                    (list stale blocked-young ready blocked-old))
-                   (list ready blocked-old blocked-young stale)))))
+                    (list stale blocked-recent ready blocked-old))
+                   (list ready blocked-recent blocked-old stale)))))
 
 (ert-deftest forge-dashboard-snooze-store-round-trip ()
   (let ((forge-dashboard-triage-file ":memory:")
@@ -251,6 +325,20 @@
           (should-not (forge-dashboard-triage-done-p
                        "topic" "2025-01-03T00:00:00Z")))
       (forge-dashboard-triage-close-store))))
+
+(ert-deftest forge-dashboard-pull-all-uses-every-tracked-repository ()
+  (let ((repos (list (forge-dashboard-test--repository "first")
+                     (forge-dashboard-test--repository "second")))
+        pulled buffer)
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'forge-dashboard--tracked-repositories)
+                 (lambda () repos))
+                ((symbol-function 'forge-dashboard--pull-repositories)
+                 (lambda (selected target)
+                   (setq pulled selected buffer target))))
+        (forge-dashboard-pull-all)
+        (should (eq buffer (current-buffer)))))
+    (should (equal pulled repos))))
 
 (ert-deftest forge-dashboard-pulls-sequentially-before-refresh ()
   (let* ((first (forge-dashboard-test--repository "first"))

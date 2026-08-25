@@ -33,9 +33,10 @@ repositories whose assignee data has not been synced."
   :type '(repeat string)
   :group 'forge-dashboard)
 
-(defcustom forge-dashboard-topics-per-repo 3
-  "Maximum number of open topics initially shown for each repository."
-  :type 'natnum
+(defcustom forge-dashboard-topics-per-repo nil
+  "Maximum number of open topics shown when a repository is expanded.
+Nil means show every topic.  Repository sections are collapsed by default."
+  :type '(choice (const :tag "All" nil) natnum)
   :group 'forge-dashboard)
 
 (defcustom forge-dashboard-stale-after 14
@@ -66,6 +67,26 @@ repositories whose assignee data has not been synced."
 (defface forge-dashboard-age-stale
   '((t :inherit error))
   "Face used for stale topic ages."
+  :group 'forge-dashboard)
+
+(defface forge-dashboard-issue
+  '((t :inherit font-lock-constant-face))
+  "Face used for issue labels and counts."
+  :group 'forge-dashboard)
+
+(defface forge-dashboard-ready
+  '((t :inherit success :weight bold))
+  "Face used for items that are ready to merge."
+  :group 'forge-dashboard)
+
+(defface forge-dashboard-blocked
+  '((t :inherit error :weight bold))
+  "Face used for items blocked on the user."
+  :group 'forge-dashboard)
+
+(defface forge-dashboard-waiting
+  '((t :inherit warning))
+  "Face used for items waiting on someone else."
   :group 'forge-dashboard)
 
 (defvar-local forge-dashboard-topic-type 'all
@@ -144,6 +165,7 @@ The returned plist contains no rendered text or buffer state."
                               (string> (or (oref left updated) "")
                                        (or (oref right updated) ""))))))))
     (list :repo repo
+          :open-topics (length all)
           :open-pullreqs (length pullreqs)
           :open-issues (length issues)
           :unread (seq-count (lambda (topic)
@@ -221,55 +243,95 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
           (format "%s ago" (forge-dashboard--age-label days))))
     "never"))
 
-(defun forge-dashboard--insert-topic (topic)
-  "Insert one TOPIC row."
+(defun forge-dashboard--topic-type-face (topic)
+  "Return the Forge-style face for TOPIC's type label."
+  (cond ((forge-pullreq-p topic) 'forge-pullreq-open)
+        ((forge-issue-p topic) 'forge-dashboard-issue)
+        (t 'forge-discussion-open)))
+
+(defun forge-dashboard--unread-badge (status)
+  "Return a fixed-width badge for topic STATUS."
+  (if (eq status 'unread)
+      (propertize "[NEW] " 'font-lock-face 'forge-dashboard-unread)
+    "      "))
+
+(defun forge-dashboard--insert-topic (topic &optional depth)
+  "Insert one TOPIC row at indentation DEPTH using Forge styling."
   (let* ((row (forge-dashboard--topic-row topic))
-         (age (plist-get row :age))
-         (status (plist-get row :status))
-         (row-face (pcase status
-                     ('unread 'forge-dashboard-unread)
-                     ('pending 'forge-dashboard-pending))))
+         (age (plist-get row :age)))
     (magit-insert-section ((eval (oref topic closql-table)) topic t)
       (insert
-       (propertize
-        (format "#%-5d %-48s %-5s @%-16s "
-                (plist-get row :number)
-                (truncate-string-to-width (plist-get row :title) 48 nil nil t)
-                (plist-get row :type)
-                (plist-get row :author))
-        'face row-face)
+       (make-string (* 2 (or depth 0)) ?\s)
+       (forge-dashboard--unread-badge (plist-get row :status))
+       (string-pad (forge--format-topic-slug topic) 7)
+       (string-pad
+        (truncate-string-to-width (forge--format-topic-title topic)
+                                  48 nil nil t)
+        49)
+       (propertize (string-pad (plist-get row :type) 6)
+                   'font-lock-face (forge-dashboard--topic-type-face topic))
+       (propertize (format "@%-16s " (plist-get row :author))
+                   'font-lock-face 'forge-dimmed)
        (propertize (forge-dashboard--age-label age)
-                   'face (forge-dashboard--age-face age))
+                   'font-lock-face (forge-dashboard--age-face age))
        "\n"))))
 
-(defun forge-dashboard--insert-repository (data)
-  "Insert repository DATA and its topic children."
+(defun forge-dashboard--repository-heading (data)
+  "Return a colorful repository heading for DATA, omitting zero counts."
+  (let* ((repo (plist-get data :repo))
+         (pullreqs (plist-get data :open-pullreqs))
+         (issues (plist-get data :open-issues))
+         (unread (plist-get data :unread))
+         (counts
+          (delq nil
+                (list
+                 (and (> pullreqs 0)
+                      (propertize (format "%d PR" pullreqs)
+                                  'font-lock-face 'forge-pullreq-open))
+                 (and (> issues 0)
+                      (propertize (format "%d issue" issues)
+                                  'font-lock-face 'forge-dashboard-issue))
+                 (and (> unread 0)
+                      (propertize (format "%d unread" unread)
+                                  'font-lock-face 'forge-dashboard-unread))))))
+    (concat (propertize (oref repo slug) 'font-lock-face 'bold)
+            (and counts (concat "  " (string-join counts "  "))))))
+
+(defun forge-dashboard--insert-repository (data &optional depth)
+  "Insert repository DATA and its topic children at indentation DEPTH."
   (let* ((repo (plist-get data :repo))
          (topics (plist-get data :topics))
-         (visible (seq-take topics forge-dashboard-topics-per-repo))
+         (visible (if forge-dashboard-topics-per-repo
+                      (seq-take topics forge-dashboard-topics-per-repo)
+                    topics))
          (remaining (- (length topics) (length visible))))
-    (magit-insert-section (forge-repo repo)
+    (magit-insert-section (forge-repo repo t)
       (magit-insert-heading
-        (format "%s  %d PR  %d issue  %d unread"
-                (oref repo slug)
-                (plist-get data :open-pullreqs)
-                (plist-get data :open-issues)
-                (plist-get data :unread)))
-      (dolist (topic visible)
-        (forge-dashboard--insert-topic topic))
-      (when (> remaining 0)
-        (magit-insert-section (forge-dashboard-more repo)
-          (insert (format "…%d more (RET to list all)\n" remaining)))))))
+        (concat (make-string (* 2 (or depth 0)) ?\s)
+                (forge-dashboard--repository-heading data)))
+      (magit-insert-section-body
+        (dolist (topic visible)
+          (forge-dashboard--insert-topic topic (1+ (or depth 0))))
+        (when (> remaining 0)
+          (magit-insert-section (forge-dashboard-more repo)
+            (insert (make-string (* 2 (1+ (or depth 0))) ?\s)
+                    (format "…%d more (RET to list all)\n" remaining))))))))
+
+(defun forge-dashboard--active-repo-data (repos)
+  "Return display data for REPOS that have at least one open topic."
+  (seq-keep (lambda (repo)
+              (let ((data (forge-dashboard--repo-data repo)))
+                (and (> (plist-get data :open-topics) 0) data)))
+            repos))
 
 (defun forge-dashboard--insert-repositories (heading repos)
-  "Insert a section named HEADING containing REPOS."
+  "Insert a section named HEADING containing non-empty REPOS."
   (magit-insert-section (forge-dashboard-group)
     (magit-insert-heading heading)
-    (if repos
-        (dolist (repo repos)
-          (forge-dashboard--insert-repository
-           (forge-dashboard--repo-data repo)))
-      (insert "No matching tracked repositories\n"))))
+    (if-let* ((data (forge-dashboard--active-repo-data repos)))
+        (dolist (repo-data data)
+          (forge-dashboard--insert-repository repo-data 1))
+      (insert "  No matching tracked repositories\n"))))
 
 (defun forge-dashboard--insert-owned (repos)
   "Insert owned repositories selected from REPOS."
@@ -285,19 +347,19 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
     (magit-insert-heading "Member repositories")
     (let ((groups
            (seq-group-by
-            (lambda (repo) (oref repo owner))
-            (seq-filter
-             (lambda (repo)
-               (eq (forge-dashboard--classify repo) 'member))
-             repos))))
+            (lambda (data) (oref (plist-get data :repo) owner))
+            (forge-dashboard--active-repo-data
+             (seq-filter
+              (lambda (repo)
+                (eq (forge-dashboard--classify repo) 'member))
+              repos)))))
       (if groups
           (dolist (group groups)
             (magit-insert-section (forge-dashboard-organization (car group))
-              (magit-insert-heading (car group))
-              (dolist (repo (cdr group))
-                (forge-dashboard--insert-repository
-                 (forge-dashboard--repo-data repo)))))
-        (insert "No matching tracked repositories\n")))))
+              (magit-insert-heading (concat "  " (car group)))
+              (dolist (data (cdr group))
+                (forge-dashboard--insert-repository data 2))))
+        (insert "  No matching tracked repositories\n")))))
 
 (defvar-keymap forge-dashboard-mode-map
   :doc "Keymap for `forge-dashboard-mode'."
@@ -305,6 +367,12 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
   "RET" #'forge-dashboard-visit
   "<return>" #'forge-dashboard-visit
   "b" #'forge-dashboard-browse
+  "o" #'forge-dashboard-browse
+  "<remap> <magit-browse-thing>" #'forge-dashboard-browse
+  "<remap> <forge-browse-topic>" #'forge-dashboard-browse
+  "<remap> <forge-browse-discussion>" #'forge-dashboard-browse
+  "<remap> <forge-browse-issue>" #'forge-dashboard-browse
+  "<remap> <forge-browse-pullreq>" #'forge-dashboard-browse
   "y" #'forge-dashboard-copy-url
   "g" #'magit-refresh
   "G" #'forge-dashboard-pull
@@ -314,6 +382,15 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
   "C" #'forge-dashboard-nudge
   "M" #'forge-dashboard-merge
   "?" #'forge-dashboard-menu)
+
+;; `defvar-keymap' preserves an existing map when this file is reloaded.
+;; Reapply browse bindings so iterative reloads behave like a fresh session.
+(dolist (binding '("b" "o" "<remap> <magit-browse-thing>"
+                   "<remap> <forge-browse-topic>"
+                   "<remap> <forge-browse-discussion>"
+                   "<remap> <forge-browse-issue>"
+                   "<remap> <forge-browse-pullreq>"))
+  (keymap-set forge-dashboard-mode-map binding #'forge-dashboard-browse))
 
 (define-derived-mode forge-dashboard-mode magit-mode "Forge Dashboard"
   "Major mode for the Forge dashboard."
@@ -346,59 +423,91 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
       ('awaiting-review (format "awaiting review %dd" age))
       ('stale (format "stale %dd" age)))))
 
-(defun forge-dashboard--attention-ball (state)
-  "Return the ball label for attention STATE."
-  (pcase state
-    ((or 'changes-requested 'they-replied 'review-requested) "on me")
-    ('awaiting-review "→ nudge?")
-    ('stale "decide")))
-
-(defun forge-dashboard--insert-attention-item (item ready)
-  "Insert attention ITEM, using the READY row format when non-nil."
+(defun forge-dashboard--insert-attention-item (item ready &optional depth)
+  "Insert attention ITEM at DEPTH, using READY format when non-nil."
   (let* ((topic (plist-get item :topic))
          (data (plist-get item :data))
-         (repo (or (plist-get data :repo) "unknown")))
+         (repo (or (plist-get data :repo) "unknown"))
+         (indent (make-string (* 2 (or depth 0)) ?\s)))
     (magit-insert-section ((eval (oref topic closql-table)) topic t)
       (if ready
-          (insert (format "✅ %-24s #%-5d %-45s %d approval%s  %s  M to merge\n"
-                          repo (oref topic number)
-                          (truncate-string-to-width (oref topic title) 45 nil nil t)
-                          (plist-get data :approvals)
-                          (if (= (plist-get data :approvals) 1) "" "s")
-                          (forge-dashboard--ci-badge (plist-get data :ci))))
-        (let ((state (plist-get item :state)))
-          (insert (format "%s %-24s #%-5d %-45s %-20s %-9s %dd\n"
-                          (if (memq state '(changes-requested they-replied
-                                            review-requested))
-                              "⛔" "⏳")
-                          repo (oref topic number)
-                          (truncate-string-to-width (oref topic title) 45 nil nil t)
-                          (forge-dashboard--attention-reason item)
-                          (forge-dashboard--attention-ball state)
-                          (plist-get item :age))))))))
+          (insert
+           indent
+           (propertize "✅ " 'font-lock-face 'forge-dashboard-ready)
+           (propertize (format "%-32s " repo) 'font-lock-face 'bold)
+           (propertize (format "#%-5d " (oref topic number))
+                       'font-lock-face 'forge-pullreq-open)
+           (format "%-45s "
+                   (truncate-string-to-width (forge--format-topic-title topic)
+                                             45 nil nil t))
+           (propertize
+            (format "%d approval%s  %s  M to merge\n"
+                    (plist-get data :approvals)
+                    (if (= (plist-get data :approvals) 1) "" "s")
+                    (forge-dashboard--ci-badge (plist-get data :ci)))
+            'font-lock-face 'forge-dashboard-ready))
+        (let* ((state (plist-get item :state))
+               (blocked (memq state '(changes-requested they-replied
+                                      review-requested)))
+               (state-face (if blocked 'forge-dashboard-blocked
+                             'forge-dashboard-waiting)))
+          (insert
+           indent
+           (propertize (if blocked "⛔ " "⏳ ")
+                       'font-lock-face state-face)
+           (propertize (format "%-32s " repo) 'font-lock-face 'bold)
+           (propertize (format "#%-5d " (oref topic number))
+                       'font-lock-face (forge-dashboard--topic-type-face topic))
+           (format "%-45s "
+                   (truncate-string-to-width (forge--format-topic-title topic)
+                                             45 nil nil t))
+           (propertize
+            (format "%-22s %dd\n"
+                    (forge-dashboard--attention-reason item)
+                    (plist-get item :age))
+            'font-lock-face state-face)))))))
+
+(defun forge-dashboard--insert-attention-group (heading items)
+  "Insert an indented attention group named HEADING containing ITEMS."
+  (when items
+    (magit-insert-section (forge-dashboard-attention-group heading)
+      (magit-insert-heading (concat "  " heading))
+      (dolist (item items)
+        (forge-dashboard--insert-attention-item item nil 2)))))
 
 (defun forge-dashboard--insert-attention (items)
-  "Insert ready and needs-attention sections from ITEMS."
+  "Insert ready and action-grouped attention sections from ITEMS."
   (let ((ready (seq-filter
                 (lambda (item)
                   (eq (plist-get item :state) 'ready-to-merge))
                 items))
-        (needs (seq-remove
+        (on-me (seq-filter
                 (lambda (item)
-                  (eq (plist-get item :state) 'ready-to-merge))
-                items)))
+                  (memq (plist-get item :state)
+                        '(changes-requested they-replied review-requested)))
+                items))
+        (nudge (seq-filter
+                (lambda (item)
+                  (eq (plist-get item :state) 'awaiting-review))
+                items))
+        (decide (seq-filter
+                 (lambda (item)
+                   (eq (plist-get item :state) 'stale))
+                 items)))
     (magit-insert-section (forge-dashboard-ready)
       (magit-insert-heading "Ready to merge")
       (if ready
           (dolist (item ready)
-            (forge-dashboard--insert-attention-item item t))
-        (insert "Nothing ready to merge\n")))
+            (forge-dashboard--insert-attention-item item t 1))
+        (insert "  Nothing ready to merge\n")))
     (magit-insert-section (forge-dashboard-attention)
       (magit-insert-heading "Needs attention")
-      (if needs
-          (dolist (item needs)
-            (forge-dashboard--insert-attention-item item nil))
-        (insert "Nothing needs attention\n")))))
+      (if (or on-me nudge decide)
+          (progn
+            (forge-dashboard--insert-attention-group "On me" on-me)
+            (forge-dashboard--insert-attention-group "Nudge" nudge)
+            (forge-dashboard--insert-attention-group "Decide" decide))
+        (insert "  Nothing needs attention\n")))))
 
 (defun forge-dashboard-refresh-buffer ()
   "Render the Forge dashboard from the local database."
@@ -406,8 +515,11 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
          (dashboard-repos (seq-filter #'forge-dashboard--classify repos))
          (attention (forge-dashboard--attention-items dashboard-repos)))
     (magit-insert-section (forge-dashboard)
-      (insert (propertize "Forge Dashboard" 'face 'bold)
-              (format "  updated %s\n\n" (forge-dashboard--updated-label)))
+      (insert (propertize "Forge Dashboard"
+                          'font-lock-face 'magit-section-heading)
+              (propertize (format "  updated %s\n\n"
+                                  (forge-dashboard--updated-label))
+                          'font-lock-face 'forge-dimmed))
       (forge-dashboard--insert-attention attention)
       (when forge-dashboard-show-owned
         (forge-dashboard--insert-owned repos))
@@ -508,6 +620,15 @@ selective repositories.  Classes without a topic API complete synchronously."
    (forge-dashboard--dashboard-repositories)
    (current-buffer)))
 
+(defun forge-dashboard-pull-all ()
+  "Pull Forge data for every tracked repository sequentially.
+This includes repositories hidden from the dashboard and repositories on
+any supported forge host."
+  (interactive)
+  (forge-dashboard--pull-repositories
+   (forge-dashboard--tracked-repositories)
+   (current-buffer)))
+
 (defun forge-dashboard-toggle-owned ()
   "Toggle the owned-repositories section."
   (interactive)
@@ -542,10 +663,12 @@ selective repositories.  Classes without a topic API complete synchronously."
   (forge-dashboard-set-type 'issue))
 
 (defun forge-dashboard-set-limit (limit)
-  "Set per-repository topic LIMIT."
-  (interactive (list (read-number "Topics per repository: "
-                                  forge-dashboard-topics-per-repo)))
-  (setq-local forge-dashboard-topics-per-repo (max 0 limit))
+  "Set per-repository topic LIMIT, with nil meaning all topics."
+  (interactive
+   (list (let ((input (read-string "Topics per repository (blank for all): ")))
+           (and (not (string-empty-p input))
+                (max 0 (string-to-number input))))))
+  (setq-local forge-dashboard-topics-per-repo limit)
   (magit-refresh))
 
 (transient-define-prefix forge-dashboard-menu ()
@@ -561,7 +684,8 @@ selective repositories.  Classes without a topic API complete synchronously."
     ("l" "Per-repo limit" forge-dashboard-set-limit)]
    ["Refresh"
     ("g" "Local database" magit-refresh)
-    ("G" "Pull dashboard repos" forge-dashboard-pull)]])
+    ("G" "Pull dashboard repos" forge-dashboard-pull)
+    ("A" "Pull all tracked repos" forge-dashboard-pull-all)]])
 
 (provide 'forge-dashboard)
 ;;; forge-dashboard.el ends here
