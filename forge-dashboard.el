@@ -181,9 +181,10 @@ The returned plist contains no rendered text or buffer state."
 (defun forge-dashboard--updated-label ()
   "Return a label describing the latest local database update."
   (if-let* ((updated (forge-dashboard--latest-update)))
-      (format "%s ago"
-              (forge-dashboard--age-label
-               (forge-dashboard--age-days updated)))
+      (let ((days (forge-dashboard--age-days updated)))
+        (if (zerop days)
+            "<1d ago"
+          (format "%s ago" (forge-dashboard--age-label days))))
     "never"))
 
 (defun forge-dashboard--insert-topic (topic)

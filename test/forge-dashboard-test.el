@@ -44,6 +44,12 @@
     (should (= (forge-dashboard--age-days nil now) 0))
     (should (= (forge-dashboard--age-days "2025-01-02T00:00:00Z" now) 0))))
 
+(ert-deftest forge-dashboard-updated-label-is-grammatical ()
+  (cl-letf (((symbol-function 'forge-dashboard--latest-update)
+             (lambda () (format-time-string "%Y-%m-%dT%H:%M:%SZ"
+                                             (current-time) t))))
+    (should (equal (forge-dashboard--updated-label) "<1d ago"))))
+
 (ert-deftest forge-dashboard-owned-account-shape-matches-forge ()
   (let ((forge-owned-accounts '(("mine" . (:remote-name "fork"))
                                  ("also-mine" . nil))))
