@@ -25,7 +25,11 @@
   :group 'forge)
 
 (defcustom forge-dashboard-organizations nil
-  "Organization owners whose tracked repositories appear in the dashboard."
+  "Extra owners whose tracked repositories count as member repositories.
+Membership is normally derived automatically: a repository is a member
+repository when your githost login is among its assignable users in
+Forge's database.  This option only adds owners on top of that, for
+repositories whose assignee data has not been synced."
   :type '(repeat string)
   :group 'forge-dashboard)
 
@@ -152,17 +156,52 @@ The returned plist contains no rendered text or buffer state."
   (seq-filter (lambda (repo) (eq (oref repo condition) :tracked))
               (forge--ls-repos)))
 
-(defun forge-dashboard--owned-owner-p (owner)
-  "Return non-nil when OWNER is configured in `forge-owned-accounts'."
-  (member owner (mapcar #'car forge-owned-accounts)))
+(defvar forge-dashboard--login-cache nil
+  "Alist caching the githost login per ghub type symbol.")
+
+(defun forge-dashboard--repo-login (repo)
+  "Return the configured githost username for REPO, or nil.
+Reads the git variable ghub itself uses (e.g. \"github.user\")
+without prompting, caching the result per githost type."
+  (let ((type (forge--ghub-type-symbol (eieio-object-class repo))))
+    (if-let* ((cached (assq type forge-dashboard--login-cache)))
+        (cdr cached)
+      (let ((login (ignore-errors (ghub--git-get (format "%s.user" type)))))
+        (push (cons type login) forge-dashboard--login-cache)
+        login))))
+
+(defun forge-dashboard--assignable-p (repo login)
+  "Return non-nil when LOGIN is an assignable user of REPO.
+Assignability implies membership or collaborator access."
+  (and login
+       (forge-sql1 [:select [login] :from assignee
+                    :where (and (= repository $s1) (= login $s2))]
+                   (oref repo id) login)
+       t))
+
+(defun forge-dashboard--classification (owner login owned-accounts orgs
+                                              assignable)
+  "Classify a repository as `owned', `member', or nil.
+Pure decision over the repository OWNER, my LOGIN, the OWNED-ACCOUNTS
+and ORGS overrides, and whether I am ASSIGNABLE in the repository."
+  (cond ((or (member owner owned-accounts)
+             (and login (equal owner login)))
+         'owned)
+        ((or (member owner orgs) assignable) 'member)))
+
+(defun forge-dashboard--classify (repo)
+  "Classify REPO as `owned', `member', or nil (external)."
+  (let ((login (forge-dashboard--repo-login repo)))
+    (forge-dashboard--classification
+     (oref repo owner) login
+     (mapcar #'car forge-owned-accounts)
+     forge-dashboard-organizations
+     (forge-dashboard--assignable-p repo login))))
 
 (defun forge-dashboard--dashboard-repositories ()
-  "Return all tracked repositories selected by dashboard configuration."
-  (seq-filter
-   (lambda (repo)
-     (or (forge-dashboard--owned-owner-p (oref repo owner))
-         (member (oref repo owner) forge-dashboard-organizations)))
-   (forge-dashboard--tracked-repositories)))
+  "Return all tracked repositories classified as owned or member."
+  (seq-filter #'forge-dashboard--classify
+              (forge-dashboard--tracked-repositories)))
 
 (defun forge-dashboard--latest-update ()
   "Return the latest repository or topic update timestamp from Forge's db."
@@ -237,20 +276,19 @@ The returned plist contains no rendered text or buffer state."
   (forge-dashboard--insert-repositories
    "Owned repositories"
    (seq-filter (lambda (repo)
-                 (forge-dashboard--owned-owner-p (oref repo owner)))
+                 (eq (forge-dashboard--classify repo) 'owned))
                repos)))
 
 (defun forge-dashboard--insert-organizations (repos)
-  "Insert organization repositories selected from REPOS, grouped by owner."
+  "Insert member repositories selected from REPOS, grouped by owner."
   (magit-insert-section (forge-dashboard-organizations)
-    (magit-insert-heading "Organizations")
+    (magit-insert-heading "Member repositories")
     (let ((groups
            (seq-group-by
             (lambda (repo) (oref repo owner))
             (seq-filter
              (lambda (repo)
-               (and (member (oref repo owner) forge-dashboard-organizations)
-                    (not (forge-dashboard--owned-owner-p (oref repo owner)))))
+               (eq (forge-dashboard--classify repo) 'member))
              repos))))
       (if groups
           (dolist (group groups)
@@ -365,12 +403,7 @@ The returned plist contains no rendered text or buffer state."
 (defun forge-dashboard-refresh-buffer ()
   "Render the Forge dashboard from the local database."
   (let* ((repos (forge-dashboard--tracked-repositories))
-         (dashboard-repos
-          (seq-filter
-           (lambda (repo)
-             (or (forge-dashboard--owned-owner-p (oref repo owner))
-                 (member (oref repo owner) forge-dashboard-organizations)))
-           repos))
+         (dashboard-repos (seq-filter #'forge-dashboard--classify repos))
          (attention (forge-dashboard--attention-items dashboard-repos)))
     (magit-insert-section (forge-dashboard)
       (insert (propertize "Forge Dashboard" 'face 'bold)
@@ -482,7 +515,7 @@ selective repositories.  Classes without a topic API complete synchronously."
   (magit-refresh))
 
 (defun forge-dashboard-toggle-organizations ()
-  "Toggle the organizations section."
+  "Toggle the member-repositories section."
   (interactive)
   (setq forge-dashboard-show-organizations
         (not forge-dashboard-show-organizations))
@@ -519,7 +552,7 @@ selective repositories.  Classes without a topic API complete synchronously."
   "Control and refresh the Forge dashboard."
   [["Sections"
     ("o" "Owned repositories" forge-dashboard-toggle-owned)
-    ("O" "Organizations" forge-dashboard-toggle-organizations)]
+    ("O" "Member repositories" forge-dashboard-toggle-organizations)]
    ["Topic type"
     ("a" "All" forge-dashboard-show-all)
     ("p" "Pull requests" forge-dashboard-show-pullreqs)

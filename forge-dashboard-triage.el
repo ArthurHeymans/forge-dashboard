@@ -19,7 +19,7 @@
 
 (defvar forge-dashboard-stale-after)
 (declare-function forge-dashboard--age-days "forge-dashboard")
-(declare-function forge-dashboard--owned-owner-p "forge-dashboard")
+(declare-function forge-dashboard--classify "forge-dashboard")
 
 (defgroup forge-dashboard-triage nil
   "Triage support for the Forge dashboard."
@@ -186,7 +186,8 @@ Each item is a plist containing `:state' and `:age'."
 
 (defun forge-dashboard-triage--slot (object slot)
   "Return OBJECT's SLOT, or nil when unavailable or unbound."
-  (and object (slot-exists-p object slot)
+  (and (eieio-object-p object)
+       (slot-exists-p object slot)
        (ignore-errors (slot-value object slot))))
 
 (defun forge-dashboard-triage--field (object field)
@@ -199,7 +200,8 @@ Each item is a plist containing `:state' and `:age'."
 
 (defun forge-dashboard-triage--review-state (review)
   "Return normalized state symbol for REVIEW."
-  (when-let* ((raw (forge-dashboard-triage--field review :state)))
+  (when-let* ((raw (or (forge-dashboard-triage--field review :state)
+                       (forge-dashboard-triage--slot review 'state))))
     (pcase (upcase (format "%s" raw))
       ("APPROVED" 'approved)
       ((or "CHANGES_REQUESTED" "CHANGES-REQUESTED") 'changes-requested)
@@ -208,11 +210,15 @@ Each item is a plist containing `:state' and `:age'."
 (defun forge-dashboard-triage--review-author (review)
   "Return the login associated with REVIEW."
   (or (forge-dashboard-triage--field review :author)
-      (forge-dashboard-triage--field review :login)))
+      (forge-dashboard-triage--field review :login)
+      (forge-dashboard-triage--slot review 'author)))
 
 (defun forge-dashboard-triage--login (assignee)
-  "Return login string for ASSIGNEE."
+  "Return login string for ASSIGNEE.
+Handles login strings, raw (id login name …) database rows as stored
+in slots like `review-requests', and EIEIO objects with a login slot."
   (or (and (stringp assignee) assignee)
+      (and (consp assignee) (stringp (nth 1 assignee)) (nth 1 assignee))
       (forge-dashboard-triage--slot assignee 'login)))
 
 (defun forge-dashboard-triage-topic-data (topic &optional now)
@@ -236,8 +242,7 @@ Each item is a plist containing `:state' and `:age'."
      (list :id (forge-dashboard-triage--slot topic 'id)
            :kind (if (forge-pullreq-p topic) 'pullreq 'topic)
            :mine (and me (equal me (forge-dashboard-triage--slot topic 'author)))
-           :owned (and repo (forge-dashboard--owned-owner-p
-                             (forge-dashboard-triage--slot repo 'owner)))
+           :owned (and repo (eq (forge-dashboard--classify repo) 'owned))
            :approvals (and review-states (seq-count
                                           (lambda (state) (eq state 'approved))
                                           review-states))

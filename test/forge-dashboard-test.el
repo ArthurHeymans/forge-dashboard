@@ -109,12 +109,26 @@
                                              (current-time) t))))
     (should (equal (forge-dashboard--updated-label) "<1d ago"))))
 
-(ert-deftest forge-dashboard-owned-account-shape-matches-forge ()
-  (let ((forge-owned-accounts '(("mine" . (:remote-name "fork"))
-                                 ("also-mine" . nil))))
-    (should (forge-dashboard--owned-owner-p "mine"))
-    (should (forge-dashboard--owned-owner-p "also-mine"))
-    (should-not (forge-dashboard--owned-owner-p "someone-else"))))
+(ert-deftest forge-dashboard-classification-derives-from-login ()
+  ;; Login match wins without any configuration.
+  (should (eq (forge-dashboard--classification "me" "me" nil nil nil) 'owned))
+  ;; Assignability alone makes a repository a member repository.
+  (should (eq (forge-dashboard--classification "org" "me" nil nil t) 'member))
+  ;; Unrelated repositories stay external.
+  (should-not (forge-dashboard--classification "other" "me" nil nil nil))
+  ;; A missing login degrades to the explicit overrides only.
+  (should-not (forge-dashboard--classification "me" nil nil nil nil)))
+
+(ert-deftest forge-dashboard-classification-honors-overrides ()
+  ;; `forge-owned-accounts' still forces ownership.
+  (should (eq (forge-dashboard--classification "mine" nil '("mine") nil nil)
+              'owned))
+  ;; Configured organizations count without assignee data.
+  (should (eq (forge-dashboard--classification "org" "me" nil '("org") nil)
+              'member))
+  ;; Owned wins over member when both match.
+  (should (eq (forge-dashboard--classification "me" "me" nil '("me") t)
+              'owned)))
 
 (ert-deftest forge-dashboard-topic-section-dispatches-actions ()
   (let ((topic (forge-dashboard-test--issue))
