@@ -30,6 +30,30 @@
   :type 'natnum
   :group 'forge-dashboard-triage)
 
+(defcustom forge-dashboard-urgency-weights
+  '((ready-to-merge . 3)
+    (changes-requested . 2)
+    (they-replied . 2)
+    (review-requested . 2)
+    (awaiting-review . 1)
+    (stale . 1))
+  "Alist mapping attention states to urgency weights.
+Higher weights sort first in the attention queue; ties break toward
+more recent activity.  States absent from the alist weigh 0."
+  :type '(alist :key-type symbol :value-type natnum)
+  :group 'forge-dashboard-triage)
+
+(defcustom forge-dashboard-attention-groups
+  '(("On me" changes-requested they-replied review-requested)
+    ("Nudge" awaiting-review)
+    ("Decide" stale))
+  "Named attention-state groups sharing one dashboard section.
+Each entry is (HEADING . STATES).  The dashboard renders one \"Needs
+attention\" subgroup per entry, and each entry also becomes a triage
+page that `forge-dashboard-triage' can visit directly."
+  :type '(repeat (cons string (repeat symbol)))
+  :group 'forge-dashboard-triage)
+
 (defcustom forge-dashboard-triage-file
   (locate-user-emacs-file "forge-dashboard-triage.sqlite")
   "SQLite file used for local snooze and done marks."
@@ -165,12 +189,10 @@ Absent host data does not satisfy rules that depend on that datum.  DATA uses
       'stale))))
 
 (defun forge-dashboard-urgency-score (state age)
-  "Return numeric urgency for STATE and AGE in days."
-  (+ (* (pcase state
-          ('ready-to-merge 3)
-          ((or 'changes-requested 'they-replied 'review-requested) 2)
-          ((or 'awaiting-review 'stale) 1)
-          (_ 0))
+  "Return numeric urgency for STATE and AGE in days.
+Weights come from `forge-dashboard-urgency-weights'; ties break toward
+more recent activity."
+  (+ (* (alist-get state forge-dashboard-urgency-weights 0)
         1000000)
      (- (max 0 (or age 0)))))
 
@@ -183,6 +205,27 @@ Each item is a plist containing `:state' and `:age'."
               (plist-get left :state) (plist-get left :age))
              (forge-dashboard-urgency-score
               (plist-get right :state) (plist-get right :age))))))
+
+(defun forge-dashboard-triage-group-items (items states)
+  "Return the ITEMS whose `:state' is a member of STATES."
+  (seq-filter (lambda (item) (memq (plist-get item :state) states))
+              items))
+
+(defun forge-dashboard-triage-page-names ()
+  "Return available triage page names in cycle order."
+  (cons "All" (cons "Ready to merge"
+                    (mapcar #'car forge-dashboard-attention-groups))))
+
+(defun forge-dashboard-triage-page-items (items page)
+  "Return the ITEMS belonging to triage PAGE.
+Nil or \"All\" returns every item; \"Ready to merge\" returns
+ready items; any other PAGE selects its `forge-dashboard-attention-groups'
+entry.  Unknown pages yield no items."
+  (cond ((or (null page) (equal page "All")) items)
+        ((equal page "Ready to merge")
+         (forge-dashboard-triage-group-items items '(ready-to-merge)))
+        (t (forge-dashboard-triage-group-items
+            items (cdr (assoc page forge-dashboard-attention-groups))))))
 
 (defun forge-dashboard-triage--slot (object slot)
   "Return OBJECT's SLOT, or nil when unavailable or unbound."
@@ -281,6 +324,8 @@ in slots like `review-requests', and EIEIO objects with a login slot."
               :age (plist-get data :activity-age))))))
 
 (defvar-local forge-dashboard-triage--items nil)
+(defvar-local forge-dashboard-triage--all-items nil)
+(defvar-local forge-dashboard-triage--page "All")
 (defvar-local forge-dashboard-triage--position 0)
 (defvar-local forge-dashboard-triage--source-buffer nil)
 
@@ -414,6 +459,31 @@ in slots like `review-requests', and EIEIO objects with a login slot."
   (interactive)
   (quit-window t))
 
+(defun forge-dashboard-triage--switch-page (direction)
+  "Switch the triage page by DIRECTION (-1 or 1), keeping all items."
+  (let* ((names (forge-dashboard-triage-page-names))
+         (index (or (cl-position forge-dashboard-triage--page names
+                                 :test #'equal)
+                    0))
+         (next (nth (mod (+ index direction) (length names)) names)))
+    (setq forge-dashboard-triage--page next
+          forge-dashboard-triage--items
+          (forge-dashboard-triage-page-items
+           forge-dashboard-triage--all-items next)
+          forge-dashboard-triage--position 0)
+    (forge-dashboard-triage--render)
+    (message "Triage page: %s" next)))
+
+(defun forge-dashboard-triage-next-page ()
+  "Switch to the next triage page."
+  (interactive)
+  (forge-dashboard-triage--switch-page 1))
+
+(defun forge-dashboard-triage-previous-page ()
+  "Switch to the previous triage page."
+  (interactive)
+  (forge-dashboard-triage--switch-page -1))
+
 (defvar-keymap forge-dashboard-triage-mode-map
   :doc "Keymap for the linear Forge dashboard triage flow."
   "M" #'forge-dashboard-merge
@@ -426,6 +496,8 @@ in slots like `review-requests', and EIEIO objects with a login slot."
   "d" #'forge-dashboard-done
   "x" #'forge-dashboard-close-topic
   "SPC" #'forge-dashboard-triage-skip
+  "n" #'forge-dashboard-triage-next-page
+  "p" #'forge-dashboard-triage-previous-page
   "q" #'forge-dashboard-triage-quit)
 
 (define-derived-mode forge-dashboard-triage-mode special-mode "Forge Triage"
@@ -442,7 +514,8 @@ in slots like `review-requests', and EIEIO objects with a login slot."
       (let* ((topic (plist-get item :topic))
              (data (plist-get item :data))
              (ci (plist-get data :ci)))
-        (insert (format "Item %d/%d\n\n"
+        (insert (format "[%s] Item %d/%d\n\n"
+                        forge-dashboard-triage--page
                         (1+ forge-dashboard-triage--position)
                         (length forge-dashboard-triage--items))
                 (format "%s #%s  %s\n"
@@ -455,17 +528,25 @@ in slots like `review-requests', and EIEIO objects with a login slot."
                         (pcase ci ('success "✓") ('failed "✗") (_ "?"))
                         (plist-get item :age))
                 "M merge  RET visit  b browse  c checkout  C nudge\n"
-                "z snooze  d done  x close  SPC skip  q quit\n")))
+                "z snooze  d done  x close  SPC skip  q quit\n"
+                "n next page  p previous page\n")))
     (goto-char (point-min))))
 
-(defun forge-dashboard-triage-start (items &optional source-buffer)
-  "Start linear triage over urgency-sorted ITEMS from SOURCE-BUFFER."
+(defun forge-dashboard-triage-start (items &optional source-buffer page)
+  "Start linear triage over urgency-sorted ITEMS from SOURCE-BUFFER.
+PAGE selects a named triage page (see `forge-dashboard-triage-page-names');
+nil or \"All\" triages every item."
   (interactive)
   (let ((buffer (get-buffer-create "*Forge Dashboard Triage*")))
     (with-current-buffer buffer
       (forge-dashboard-triage-mode)
-      (setq forge-dashboard-triage--items
+      (setq forge-dashboard-triage--all-items
             (forge-dashboard-sort-attention items)
+            forge-dashboard-triage--page (or page "All")
+            forge-dashboard-triage--items
+            (forge-dashboard-triage-page-items
+             forge-dashboard-triage--all-items
+             forge-dashboard-triage--page)
             forge-dashboard-triage--position 0
             forge-dashboard-triage--source-buffer source-buffer)
       (forge-dashboard-triage--render))

@@ -475,24 +475,17 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
         (forge-dashboard--insert-attention-item item nil 2)))))
 
 (defun forge-dashboard--insert-attention (items)
-  "Insert ready and action-grouped attention sections from ITEMS."
+  "Insert ready and action-grouped attention sections from ITEMS.
+Subgroups follow `forge-dashboard-attention-groups'."
   (let ((ready (seq-filter
                 (lambda (item)
                   (eq (plist-get item :state) 'ready-to-merge))
                 items))
-        (on-me (seq-filter
-                (lambda (item)
-                  (memq (plist-get item :state)
-                        '(changes-requested they-replied review-requested)))
-                items))
-        (nudge (seq-filter
-                (lambda (item)
-                  (eq (plist-get item :state) 'awaiting-review))
-                items))
-        (decide (seq-filter
-                 (lambda (item)
-                   (eq (plist-get item :state) 'stale))
-                 items)))
+        (groups (mapcar (lambda (group)
+                          (cons (car group)
+                                (forge-dashboard-triage-group-items
+                                 items (cdr group))))
+                        forge-dashboard-attention-groups)))
     (magit-insert-section (forge-dashboard-ready)
       (magit-insert-heading "Ready to merge")
       (if ready
@@ -501,11 +494,9 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
         (insert "  Nothing ready to merge\n")))
     (magit-insert-section (forge-dashboard-attention)
       (magit-insert-heading "Needs attention")
-      (if (or on-me nudge decide)
-          (progn
-            (forge-dashboard--insert-attention-group "On me" on-me)
-            (forge-dashboard--insert-attention-group "Nudge" nudge)
-            (forge-dashboard--insert-attention-group "Decide" decide))
+      (if (seq-some #'cdr groups)
+          (dolist (group groups)
+            (forge-dashboard--insert-attention-group (car group) (cdr group)))
         (insert "  Nothing needs attention\n")))))
 
 (defun forge-dashboard-refresh-buffer ()
@@ -554,13 +545,19 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
          (forge-browse-repository (forge-repository-at-point)))
         (t (user-error "No topic or repository at point"))))
 
-(defun forge-dashboard-triage ()
-  "Start linear triage over the current dashboard attention queue."
-  (interactive)
+(defun forge-dashboard-triage (&optional page)
+  "Start linear triage over the current dashboard attention queue.
+With a prefix argument, prompt for a triage PAGE (see
+`forge-dashboard-triage-page-names'); otherwise triage all items."
+  (interactive
+   (list (when current-prefix-arg
+           (completing-read "Triage page: "
+                            (forge-dashboard-triage-page-names)
+                            nil t nil nil "All"))))
   (forge-dashboard-triage-start
    (forge-dashboard--attention-items
     (forge-dashboard--dashboard-repositories))
-   (current-buffer)))
+   (current-buffer) page))
 
 (defun forge-dashboard-copy-url ()
   "Copy the URL of the topic or repository at point."

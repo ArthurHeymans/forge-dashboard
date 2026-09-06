@@ -362,5 +362,60 @@
       (funcall (pop callbacks))
       (should (= refreshes 1)))))
 
+(ert-deftest forge-dashboard-urgency-weights-are-customizable ()
+  (let ((forge-dashboard-urgency-weights '((stale . 5) (ready-to-merge . 1))))
+    (should (> (forge-dashboard-urgency-score 'stale 100)
+               (forge-dashboard-urgency-score 'ready-to-merge 0)))
+    (should (= (forge-dashboard-urgency-score 'unknown-state 3) -3))))
+
+(ert-deftest forge-dashboard-triage-pages-filter-by-group ()
+  (let ((forge-dashboard-attention-groups
+         '(("On me" changes-requested) ("Rest" stale)))
+        (items (list '(:state ready-to-merge :age 1)
+                     '(:state changes-requested :age 1)
+                     '(:state stale :age 1))))
+    (should (equal (forge-dashboard-triage-page-names)
+                   '("All" "Ready to merge" "On me" "Rest")))
+    (should (= (length (forge-dashboard-triage-page-items items "All")) 3))
+    (should (equal (forge-dashboard-triage-page-items items nil) items))
+    (should (equal (forge-dashboard-triage-page-items items "Ready to merge")
+                   '((:state ready-to-merge :age 1))))
+    (should (equal (forge-dashboard-triage-page-items items "On me")
+                   '((:state changes-requested :age 1))))
+    (should-not (forge-dashboard-triage-page-items items "Nope"))))
+
+(ert-deftest forge-dashboard-triage-start-selects-page ()
+  (let ((items (list '(:state ready-to-merge :age 1)
+                     '(:state stale :age 2))))
+    (cl-letf (((symbol-function 'pop-to-buffer) #'ignore))
+      (forge-dashboard-triage-start items nil "Ready to merge")
+      (unwind-protect
+          (with-current-buffer "*Forge Dashboard Triage*"
+            (should (equal forge-dashboard-triage--page "Ready to merge"))
+            (should (= (length forge-dashboard-triage--all-items) 2))
+            (should (= (length forge-dashboard-triage--items) 1))
+            (should (eq (plist-get (car forge-dashboard-triage--items)
+                                   :state)
+                        'ready-to-merge))
+            (forge-dashboard-triage-next-page)
+            (should (equal forge-dashboard-triage--page "On me")))
+        (kill-buffer "*Forge Dashboard Triage*")))))
+
+(ert-deftest forge-dashboard-attention-groups-are-customizable ()
+  (let* ((forge-dashboard-attention-groups '(("Mine" changes-requested)))
+         (topic (forge-dashboard-test--issue))
+         (items (list (list :topic topic
+                            :data (list :repo "owner/repo" :approvals 0
+                                        :ci nil)
+                            :state 'changes-requested :age 2))))
+    (with-temp-buffer
+      (forge-dashboard-mode)
+      (let ((inhibit-read-only t))
+        (magit-insert-section (forge-dashboard-test-root)
+          (forge-dashboard--insert-attention items)))
+      (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+        (should (string-match-p "Mine" text))
+        (should-not (string-match-p "Nudge" text))))))
+
 (provide 'forge-dashboard-test)
 ;;; forge-dashboard-test.el ends here
