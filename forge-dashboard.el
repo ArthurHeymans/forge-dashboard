@@ -395,7 +395,6 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
 (define-derived-mode forge-dashboard-mode magit-mode "Forge Dashboard"
   "Major mode for the Forge dashboard."
   :interactive nil
-  (setq-local default-directory "/")
   (setq-local forge-buffer-unassociated-p t))
 
 (defun forge-dashboard--attention-items (repos &optional now)
@@ -532,7 +531,6 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
   (interactive)
   (magit-setup-buffer #'forge-dashboard-mode nil
     :buffer (get-buffer-create "*forge-dashboard*")
-    (default-directory "/")
     (forge-buffer-unassociated-p t)))
 
 (defun forge-dashboard-visit ()
