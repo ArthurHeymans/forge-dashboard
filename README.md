@@ -32,14 +32,14 @@ Forge's draft face.
 
 ## Attention states
 
-| Badge | State | Meaning |
-|-------|-------|---------|
-| ✅ | `ready-to-merge` | My PR (or a PR in an owned repo): ≥1 approval, no `CHANGES_REQUESTED`, not a draft, no merge conflict. CI is shown but never gates. |
-| ⛔ | `changes-requested` | My PR whose latest review requests changes. |
-| ⛔ | `they-replied` | My topic with a reply from someone else, still unread/pending. |
-| ⛔ | `review-requested` | I am a requested reviewer and haven't reviewed yet. |
-| ⏳ | `awaiting-review` | My PR with no review activity for `forge-dashboard-awaiting-review-after` days (7). |
-| ⏳ | `stale` | No activity for `forge-dashboard-stale-after` days (14). |
+| Badge | State               | Meaning                                                                                                                             |
+|-------|---------------------|-------------------------------------------------------------------------------------------------------------------------------------|
+| ✅    | `ready-to-merge`    | My PR (or a PR in an owned repo): ≥1 approval, no `CHANGES_REQUESTED`, not a draft, no merge conflict. CI is shown but never gates. |
+| ⛔    | `changes-requested` | My PR whose latest review requests changes.                                                                                         |
+| ⛔    | `they-replied`      | My topic with a reply from someone else, still unread/pending.                                                                      |
+| ⛔    | `review-requested`  | I am a requested reviewer and haven't reviewed yet.                                                                                 |
+| ⏳    | `awaiting-review`   | My PR with no review activity for `forge-dashboard-awaiting-review-after` days (7).                                                 |
+| ⏳    | `stale`             | No activity for `forge-dashboard-stale-after` days (14).                                                                            |
 
 Items are urgency-sorted: ready first, then blocked on you, then stale.
 Rules degrade gracefully per host: missing data (e.g. no CI or review
@@ -68,17 +68,17 @@ Clone next to Forge and add both to your `load-path`, e.g. with
 
 Dashboard keys:
 
-| Key | Action |
-|-----|--------|
-| `RET` | Visit topic (or list the repository's topics) |
-| `b` | Browse topic or repository in a browser |
-| `y` | Copy topic or repository URL |
-| `g` / `G` | Refresh from the local db / pull each dashboard repo |
-| `t` | Start linear triage over the attention queue |
-| `z` / `d` | Snooze topic / mark done until new activity |
-| `C` | Nudge with a pre-filled comment template |
-| `M` | Merge (ready rows only) |
-| `?` | Dashboard menu: section toggles, type filter, per-repo limit |
+| Key       | Action                                                       |
+|-----------|--------------------------------------------------------------|
+| `RET`     | Visit topic (or list the repository's topics)                |
+| `b`       | Browse topic or repository in a browser                      |
+| `y`       | Copy topic or repository URL                                 |
+| `g` / `G` | Refresh from the local db / pull each dashboard repo         |
+| `t`       | Start linear triage over the attention queue                 |
+| `z` / `d` | Snooze topic / mark done until new activity                  |
+| `C`       | Nudge with a pre-filled comment template                     |
+| `M`       | Merge (ready rows only)                                      |
+| `?`       | Dashboard menu: section toggles, type filter, per-repo limit |
 
 Triage (`t`) walks the queue one item at a time: `M` merge, `RET`
 visit, `b` browse, `c` check out the PR, `C` comment from
@@ -106,38 +106,6 @@ Snooze/done marks live in a small local SQLite store
 
 `make check` byte-compiles (warnings as errors) and runs the focused
 ERT suite in `test/`.
-
-## Regenerating the screenshot
-
-The screenshot above is synthetic: `demo/forge-dashboard-demo.el`
-installs a fake backend (repositories, topics, triage states) so the
-dashboard renders without network access or a real Forge database. It
-was captured in an isolated virtual Wayland workspace — a headless
-nested Sway compositor — so the live session is never disturbed:
-
-```sh
-# 1. Start a headless nested compositor (its own WAYLAND_DISPLAY).
-WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
-  sway -c /dev/stdin <<'EOF' &
-output HEADLESS-1 resolution 1440x810 position 0,0 scale 1
-EOF
-
-# 2. Open the demo on that display (load flags as in `make -n compile`).
-WAYLAND_DISPLAY=wayland-1 emacs -Q $(make -n compile | grep -o '\-L [^ ]*' | tr '\n' ' ') \
-  --eval '(setq load-prefer-newer t)' -L demo -l forge-dashboard-demo \
-  --eval '(forge-dashboard-demo-show)' &
-
-# 3. Fullscreen the frame and capture the nested compositor.
-swaymsg -s <nested-sway-ipc.sock> '[app_id="Emacs"] fullscreen enable'
-WAYLAND_DISPLAY=wayland-1 grim assets/dashboard.png
-```
-
-To verify the demo data without a display:
-
-```sh
-emacs -Q --batch <same load flags> -L demo -l forge-dashboard-demo \
-  --eval '(forge-dashboard-demo-print)'
-```
 
 ## License
 
