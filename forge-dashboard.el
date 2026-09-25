@@ -202,19 +202,30 @@ The returned plist contains no rendered text or buffer state."
   (seq-filter (lambda (repo) (eq (oref repo condition) :tracked))
               (forge--ls-repos)))
 
-(defvar forge-dashboard--login-cache nil
-  "Alist caching the githost login per ghub type symbol.")
+(defvar forge-dashboard--repo-data-cache nil
+  "Refresh-local cache of repository data keyed by type and repository.")
+
+(defvar forge-dashboard--classification-cache nil
+  "Refresh-local cache of repository classifications keyed by repository ID.")
+
+(defun forge-dashboard--cached-repo-data (repo)
+  "Return REPO's data, reusing the current refresh-local cache when present."
+  (let* ((type forge-dashboard-topic-type)
+         (entry (seq-find
+                 (lambda (entry)
+                   (and (eq (nth 0 entry) type)
+                        (eq (nth 1 entry) repo)))
+                 forge-dashboard--repo-data-cache)))
+    (or (nth 2 entry)
+        (let ((data (forge-dashboard--repo-data repo)))
+          (push (list type repo data) forge-dashboard--repo-data-cache)
+          data))))
 
 (defun forge-dashboard--repo-login (repo)
   "Return the configured githost username for REPO, or nil.
-Reads the git variable ghub itself uses (e.g. \"github.user\")
-without prompting, caching the result per githost type."
-  (let ((type (forge--ghub-type-symbol (eieio-object-class repo))))
-    (if-let* ((cached (assq type forge-dashboard--login-cache)))
-        (cdr cached)
-      (let ((login (ignore-errors (ghub--git-get (format "%s.user" type)))))
-        (push (cons type login) forge-dashboard--login-cache)
-        login))))
+Use Ghub's Forge repository method so host-specific Git variables and
+fallbacks are handled consistently, without prompting."
+  (ignore-errors (ghub--username repo)))
 
 (defun forge-dashboard--assignable-p (repo login)
   "Return non-nil when LOGIN is an assignable user of REPO.
@@ -237,6 +248,20 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
 
 (defun forge-dashboard--classify (repo)
   "Classify REPO as `owned', `member', or nil (external)."
+  (if (hash-table-p forge-dashboard--classification-cache)
+      (let* ((id (oref repo id))
+             (entry (gethash id forge-dashboard--classification-cache)))
+        (if entry
+            (car entry)
+          (let ((classification
+                 (forge-dashboard--classify-uncached repo)))
+            (puthash id (list classification)
+                     forge-dashboard--classification-cache)
+            classification)))
+    (forge-dashboard--classify-uncached repo)))
+
+(defun forge-dashboard--classify-uncached (repo)
+  "Classify REPO without consulting the refresh-local cache."
   (let ((login (forge-dashboard--repo-login repo)))
     (forge-dashboard--classification
      (oref repo owner) login
@@ -344,7 +369,7 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
 (defun forge-dashboard--active-repo-data (repos)
   "Return display data for REPOS that have at least one open topic."
   (seq-keep (lambda (repo)
-              (let ((data (forge-dashboard--repo-data repo)))
+              (let ((data (forge-dashboard--cached-repo-data repo)))
                 (and (> (plist-get data :open-topics) 0) data)))
             repos))
 
@@ -423,18 +448,22 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
 
 (defun forge-dashboard--attention-items (repos &optional now)
   "Return urgency-sorted attention items for REPOS at NOW."
-  (forge-dashboard-sort-attention
-   (seq-keep
-    (lambda (topic) (forge-dashboard-triage-item topic now))
-    (mapcan
-     (lambda (repo)
-       (let ((forge-dashboard-topic-type 'all))
-         (copy-sequence (plist-get (forge-dashboard--repo-data repo) :topics))))
-     repos))))
+  (let ((forge-dashboard-triage--state-cache
+         (or forge-dashboard-triage--state-cache
+             (forge-dashboard-triage--load-state-cache))))
+    (forge-dashboard-sort-attention
+     (seq-keep
+      (lambda (topic) (forge-dashboard-triage-item topic now))
+      (mapcan
+       (lambda (repo)
+         (let ((forge-dashboard-topic-type 'all))
+           (copy-sequence (plist-get (forge-dashboard--cached-repo-data repo)
+                                     :topics))))
+       repos)))))
 
 (defun forge-dashboard--ci-badge (ci)
   "Return an informational badge for CI."
-  (pcase ci ('success "CI ✓") ('failed "CI ✗") (_ "CI ?")))
+  (pcase ci ('success "CI ✓") ('failed "CI ✗") (_ "CI n/a")))
 
 (defun forge-dashboard--attention-reason (item)
   "Return the human-readable reason for attention ITEM."
@@ -525,7 +554,10 @@ Subgroups follow `forge-dashboard-attention-groups'."
 
 (defun forge-dashboard-refresh-buffer ()
   "Render the Forge dashboard from the local database."
-  (let* ((repos (forge-dashboard--tracked-repositories))
+  (let* ((forge-dashboard--repo-data-cache nil)
+         (forge-dashboard--classification-cache
+          (make-hash-table :test #'equal))
+         (repos (forge-dashboard--tracked-repositories))
          (dashboard-repos (seq-filter #'forge-dashboard--classify repos))
          (attention (forge-dashboard--attention-items dashboard-repos)))
     (magit-insert-section (forge-dashboard)
@@ -618,7 +650,9 @@ Forge API-backed pulls invoke their callback after storing data, except for
 selective repositories.  Classes without a topic API complete synchronously."
   (when (buffer-live-p buffer)
     (if-let* ((repo (car repos)))
-        (let ((next (lambda ()
+        (let ((next (lambda (&rest _args)
+                      ;; Forge 0.5.x passes the repository to this callback;
+                      ;; newer local Forge revisions call it without arguments.
                       (forge-dashboard--pull-repositories (cdr repos) buffer))))
           (with-current-buffer buffer
             (cond ((or (cl-typep repo 'forge-noapi-repository)

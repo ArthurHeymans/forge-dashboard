@@ -8,9 +8,13 @@
 (require 'forge-discussion)
 (require 'forge-issue)
 (require 'forge-pullreq)
+(require 'forge-github)
+
+(defclass forge-dashboard-test-database (forge-database) ())
 
 (defclass forge-dashboard-test-repository ()
-  ((owner :initarg :owner)
+  ((id :initarg :id)
+   (owner :initarg :owner)
    (name :initarg :name)
    (slug :initarg :slug)
    (selective-p :initarg :selective-p :initform nil)))
@@ -18,6 +22,7 @@
 (defun forge-dashboard-test--repository (name &optional selective)
   "Make a synthetic repository named NAME with SELECTIVE pull behavior."
   (forge-dashboard-test-repository
+   :id (format "repo-%s" name)
    :owner "owner" :name name :slug (format "owner/%s" name)
    :selective-p selective))
 
@@ -28,6 +33,14 @@
          :author "octocat" :title "Triage this" :created "2025-01-01T00:00:00Z"
          :updated "2025-01-10T00:00:00Z" :status 'done
          slots))
+
+(ert-deftest forge-dashboard-repo-login-uses-ghub-repository-method ()
+  (let ((repo (forge-dashboard-test--repository "login")))
+    (cl-letf (((symbol-function 'ghub--username)
+               (lambda (object)
+                 (should (eq object repo))
+                 "octocat")))
+      (should (equal (forge-dashboard--repo-login repo) "octocat")))))
 
 (ert-deftest forge-dashboard-topic-row-is-pure-data ()
   (let* ((topic (forge-dashboard-test--issue :status 'unread))
@@ -88,6 +101,11 @@
                 :updated "2025-01-02T00:00:00Z" :status 'pending)))
     (should (equal (plist-get (forge-dashboard--topic-row topic) :type) "PR"))))
 
+(ert-deftest forge-dashboard-ci-badge-marks-unavailable-data ()
+  (should (equal (forge-dashboard--ci-badge nil) "CI n/a"))
+  (should (equal (forge-dashboard--ci-badge 'success) "CI ✓"))
+  (should (equal (forge-dashboard--ci-badge 'failed) "CI ✗")))
+
 (ert-deftest forge-dashboard-unread-face-is-red-and-bold ()
   (should (eq (face-attribute 'forge-dashboard-unread :inherit nil t)
               'forge-topic-slug-unread))
@@ -130,6 +148,25 @@
   ;; A missing login degrades to the explicit overrides only.
   (should-not (forge-dashboard--classification "me" nil nil nil nil)))
 
+(ert-deftest forge-dashboard-classification-cache-uses-repository-id ()
+  (let ((forge-dashboard--classification-cache
+         (make-hash-table :test #'equal))
+        (calls 0))
+    (cl-letf (((symbol-function 'forge-dashboard--classify-uncached)
+               (lambda (repo)
+                 (cl-incf calls)
+                 (and (equal (oref repo name) "owned") 'owned))))
+      ;; Forge reconstructs a fresh repository object for each topic.
+      (should (eq (forge-dashboard--classify
+                   (forge-dashboard-test--repository "owned")) 'owned))
+      (should (eq (forge-dashboard--classify
+                   (forge-dashboard-test--repository "owned")) 'owned))
+      (should-not (forge-dashboard--classify
+                   (forge-dashboard-test--repository "external")))
+      (should-not (forge-dashboard--classify
+                   (forge-dashboard-test--repository "external")))
+      (should (= calls 2)))))
+
 (ert-deftest forge-dashboard-classification-honors-overrides ()
   ;; `forge-owned-accounts' still forces ownership.
   (should (eq (forge-dashboard--classification "mine" nil '("mine") nil nil)
@@ -150,6 +187,23 @@
                        (if (equal (oref repo name) "active") 1 0)))))
       (should (equal (forge-dashboard--active-repo-data (list active empty))
                      (list (list :repo active :open-topics 1)))))))
+
+(ert-deftest forge-dashboard-repository-data-is-cached-per-refresh ()
+  (let* ((repo (forge-dashboard-test--repository "cached"))
+         (forge-dashboard--repo-data-cache nil)
+         (forge-dashboard-topic-type 'all)
+         (calls 0)
+         (data (list :repo repo :open-topics 1)))
+    (cl-letf (((symbol-function 'forge-dashboard--repo-data)
+               (lambda (_repo) (cl-incf calls) data)))
+      (should (eq (forge-dashboard--cached-repo-data repo) data))
+      (should (eq (forge-dashboard--cached-repo-data repo) data))
+      (should (= calls 1))
+      (let ((forge-dashboard-topic-type 'pr))
+        (should (eq (forge-dashboard--cached-repo-data repo) data))
+        (should (= calls 2)))
+      (should (eq (forge-dashboard--cached-repo-data repo) data))
+      (should (= calls 2)))))
 
 (ert-deftest forge-dashboard-repository-heading-hides-zero-counts ()
   (let* ((repo (forge-dashboard-test--repository "colorful"))
@@ -292,12 +346,165 @@
                  (append base '(:ci failed)))
                 'ready-to-merge))
     (should (eq (forge-dashboard-attention-state base) 'ready-to-merge))
+    ;; Another reviewer's later approval cannot clear a changes request.
+    (should-not (forge-dashboard-attention-state
+                 '(:kind pullreq :mine t :approvals 1
+                   :review-states (changes-requested approved)
+                   :latest-review approved :draft nil
+                   :merge-conflict nil :activity-age 1)))
     (should-not (forge-dashboard-attention-state
                  '(:kind pullreq :mine t :approvals 1 :draft nil
                    :merge-conflict nil :activity-age 1)))
     (should-not (forge-dashboard-attention-state
                  '(:kind pullreq :mine t :approvals 1
-                   :review-states (approved) :draft nil :activity-age 1)))))
+                   :review-states (approved) :draft nil :activity-age 1)))
+    (should-not (forge-dashboard-attention-state
+                 '(:kind pullreq :mine t :activity-age 8)))))
+
+(ert-deftest forge-dashboard-merge-refuses-unresolved-changes-request ()
+  "The merge command must not reach Forge for a blocked pull request."
+  (let ((topic (forge-pullreq :id "pr-id" :repository "repo-id"))
+        (forge-dashboard-triage-file ":memory:")
+        (merge-calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'forge-dashboard-triage--current-topic)
+                   (lambda () topic))
+                  ((symbol-function 'forge-dashboard-triage-topic-data)
+                   (lambda (&rest _)
+                     '(:id "pr-id" :kind pullreq :mine t :approvals 1
+                       :review-states (changes-requested approved)
+                       :latest-review approved :draft nil
+                       :merge-conflict nil :activity-age 1)))
+                  ((symbol-function 'forge-merge)
+                   (lambda (&rest _) (cl-incf merge-calls))))
+          (should-error (forge-dashboard-merge) :type 'user-error)
+          (should (zerop merge-calls)))
+      (forge-dashboard-triage-close-store))))
+
+(ert-deftest forge-dashboard-triage-raw-assignee-row-uses-login-column ()
+  ;; `closql-dref' uses `forge-sql-cdr', which drops the repository column.
+  (should (equal (forge-dashboard-triage--login
+                  '("assignee-id" "octocat" "Octo Cat" "forge-id"))
+                 "octocat")))
+
+(ert-deftest forge-dashboard-triage-recognizes-requested-reviewer ()
+  (let ((topic (forge-pullreq
+                :id "pr-id" :repository "repo-id" :number 7 :state 'open
+                :author "someone" :title "Review me"
+                :created "2025-01-01T00:00:00Z"
+                :updated "2025-01-20T00:00:00Z" :status 'pending)))
+    (oset topic review-requests
+          '(("assignee-id" "me" "My Display Name" "forge-id")))
+    (cl-letf (((symbol-function 'forge-get-repository)
+               (lambda (_topic) (forge-dashboard-test--repository "repo")))
+              ((symbol-function 'ghub--username) (lambda (_repo) "me"))
+              ((symbol-function 'forge-dashboard--classify)
+               (lambda (_repo) 'member)))
+      (let ((data (forge-dashboard-triage-topic-data topic)))
+        (should (plist-get data :review-requested))
+        (should (eq (forge-dashboard-attention-state data)
+                    'review-requested))))))
+
+(ert-deftest forge-dashboard-renders-review-request-from-forge-database ()
+  "Read a real Forge relation through triage and render its dashboard row."
+  (let* ((directory (make-temp-file "forge-dashboard-test-" t))
+         (forge-database-file (expand-file-name "forge.sqlite" directory))
+         (forge-dashboard-triage-file ":memory:")
+         (repo (forge-github-repository
+                :id "repo-id" :owner "other" :name "project"
+                :apihost "api.github.com" :githost "github.com"))
+         (topic (forge-pullreq
+                 :id "pr-id" :repository "repo-id" :number 7 :state 'open
+                 :author "someone" :title "Review me"
+                 :created "2025-01-01T00:00:00Z"
+                 :updated "2025-01-20T00:00:00Z" :status 'pending
+                 :draft-p nil))
+         (classifications 0)
+         (classify (symbol-function 'forge-dashboard--classify-uncached)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'forge-db)
+                   (lambda (&optional livep)
+                     (closql-db 'forge-dashboard-test-database livep)))
+                  ((symbol-function 'ghub--username) (lambda (_repo) "me"))
+                  ((symbol-function 'forge-dashboard--classify-uncached)
+                   (lambda (repository)
+                     (cl-incf classifications)
+                     (funcall classify repository))))
+          (oset repo condition :tracked)
+          (closql-insert (forge-db) repo)
+          (closql-insert (forge-db) topic)
+          (forge-sql [:insert-into assignee :values $v1]
+                     (vector "repo-id" "user-id" "me" "My Name" "host-id"))
+          (forge-sql [:insert-into pullreq-review-request :values $v1]
+                     (vector "pr-id" "user-id"))
+          (should (equal (forge-dashboard--latest-update)
+                         "2025-01-20T00:00:00Z"))
+          (let* ((stored-repo (car (forge-dashboard--tracked-repositories)))
+                 (stored-topic (car (plist-get
+                                     (forge-dashboard--repo-data stored-repo)
+                                     :topics))))
+            (should (equal (oref stored-topic review-requests)
+                           '(("user-id" "me" "My Name" "host-id")))))
+          (with-temp-buffer
+            (forge-dashboard-mode)
+            (let ((inhibit-read-only t))
+              (magit-insert-section (forge-dashboard-test-root)
+                (forge-dashboard-refresh-buffer)))
+            (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "review requested" text))
+              (should (string-match-p "Review me" text))
+              (should-not (string-match-p "Nothing needs attention" text))))
+          ;; The topic's repository was reconstructed separately by Forge.
+          (should (= classifications 1))
+          (should (eq (plist-get
+                       (car (forge-dashboard--attention-items
+                             (forge-dashboard--dashboard-repositories)))
+                       :state)
+                      'review-requested))
+          (forge-dashboard-triage-snooze
+           "pr-id" (time-add (current-time) (days-to-time 1)))
+          (with-temp-buffer
+            (forge-dashboard-mode)
+            (let ((inhibit-read-only t))
+              (magit-insert-section (forge-dashboard-test-root)
+                (forge-dashboard-refresh-buffer)))
+            (should (string-match-p
+                     "Nothing needs attention"
+                     (buffer-substring-no-properties (point-min) (point-max))))))
+      (forge-dashboard-triage-close-store)
+      (when-let* ((db (closql-db 'forge-dashboard-test-database t)))
+        (emacsql-close db))
+      (delete-directory directory t))))
+
+(ert-deftest forge-dashboard-triage-degrades-with-unbound-reviews ()
+  (let ((topic (forge-pullreq
+                :id "pr-id" :repository "repo-id" :number 7 :state 'open
+                :author "me" :title "Needs review" :created "2025-01-01T00:00:00Z"
+                :updated "2025-01-20T00:00:00Z" :status 'pending)))
+    (cl-letf (((symbol-function 'forge-get-repository)
+               (lambda (_topic) (forge-dashboard-test--repository "repo")))
+              ((symbol-function 'ghub--username) (lambda (_repo) "me"))
+              ((symbol-function 'forge-dashboard--classify)
+               (lambda (_repo) 'member)))
+      (let ((data (forge-dashboard-triage-topic-data
+                   topic (date-to-time "2025-01-21T00:00:00Z"))))
+        (should-not (plist-get data :review-age))
+        (should-not (plist-get data :approvals))
+        (should-not (plist-get data :review-requested))
+        (should-not (plist-get data :reviewed-by-me))))))
+
+(ert-deftest forge-dashboard-review-timestamp-is-not-topic-age ()
+  (let ((reviews '(((state . changes-requested)
+                    (updated . "2025-01-01T00:00:00Z"))
+                   ((state . approved)
+                    (updated . "2025-01-19T00:00:00Z"))))
+        (now (date-to-time "2025-01-20T00:00:00Z")))
+    (should (= (forge-dashboard--age-days
+                (forge-dashboard-triage--latest-review-updated reviews)
+                now)
+               1))
+    (should-not (forge-dashboard-attention-state
+                 '(:kind pullreq :mine t :review-age 1 :activity-age 8)))))
 
 (ert-deftest forge-dashboard-urgency-orders-state-then-recency ()
   (let* ((stale '(:state stale :age 100))
@@ -356,10 +563,10 @@
       (forge-dashboard-pull)
       (should (equal calls (list first)))
       (should (zerop refreshes))
-      (funcall (pop callbacks))
+      (funcall (pop callbacks) first)
       (should (equal calls (list first second)))
       (should (zerop refreshes))
-      (funcall (pop callbacks))
+      (funcall (pop callbacks) second)
       (should (= refreshes 1)))))
 
 (ert-deftest forge-dashboard-urgency-weights-are-customizable ()

@@ -11,7 +11,9 @@ touched when you explicitly pull with Forge's commands.
 
 ## Sections
 
-- **Ready to merge** — approved PRs, with CI status and an `M` merge hint.
+- **Ready to merge** — approved PRs when Forge's local data includes the
+  required review and mergeability data, with CI status when available and an
+  `M` merge hint.
 - **Needs attention** — grouped as **On me**, **Nudge**, and **Decide**. Each
   row states the reason (`changes requested`, `they replied`,
   `review requested`, `awaiting review 9d`, `stale 21d`).
@@ -27,16 +29,25 @@ after 7 days, stale). Draft PRs use Forge's draft face.
 
 | Badge | State               | Meaning                                                                                                   |
 |-------|---------------------|-----------------------------------------------------------------------------------------------------------|
-| ✅    | `ready-to-merge`    | My PR (or a PR in an owned repo): approved, no `CHANGES_REQUESTED`, not a draft, no conflicts. CI never gates. |
-| ⛔    | `changes-requested` | My PR whose latest review requests changes.                                                               |
+| ✅    | `ready-to-merge`    | My PR (or a PR in an owned repo): approved, no known `CHANGES_REQUESTED` review, not a draft, no conflicts, when Forge provides those data. CI never gates. |
+| ⛔    | `changes-requested` | My PR whose latest known review requests changes.                                                        |
 | ⛔    | `they-replied`      | My topic with an unread reply from someone else.                                                          |
 | ⛔    | `review-requested`  | I am a requested reviewer and haven't reviewed yet.                                                       |
-| ⏳    | `awaiting-review`   | My PR with no review for `forge-dashboard-awaiting-review-after` days (7).                                |
+| ⏳    | `awaiting-review`   | My PR with a known last review older than `forge-dashboard-awaiting-review-after` days (7).               |
 | ⏳    | `stale`             | No activity for `forge-dashboard-stale-after` days (14).                                                  |
 
 Rows are urgency-sorted: ready first, then blocked on you, then stale. A rule
 only fires when the host provides the data, so e.g. repos without CI or
 review state simply skip those rules.
+
+Forge 0.5.x does not retain review states, mergeability, or CI in its local
+SQLite database. This package therefore does not guess those values from PR
+age or other unrelated fields. When review states are supplied, any known
+changes request conservatively prevents a merge-ready classification; a later
+approval alone does not prove that request was resolved. With the current
+Forge database, review-derived states may be absent and CI is displayed as
+`n/a`; a Forge host integration
+must persist the relevant data before those states can appear.
 
 ## Requirements
 

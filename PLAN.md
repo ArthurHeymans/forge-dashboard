@@ -83,13 +83,18 @@ Attention states, computed locally per open topic at redraw:
 | changes-requested  | ⛔    | my PR, latest review = CHANGES_REQUESTED                             | me |
 | they-replied       | ⛔    | my topic, last comment not mine, topic unread/pending                | me |
 | review-requested   | ⛔    | I am requested reviewer, no review from me yet                       | me |
-| awaiting-review    | ⏳    | my PR, no review activity for `forge-dashboard-stale-after` (7d)     | them → nudge |
+| awaiting-review    | ⏳    | my PR, known last review older than `forge-dashboard-awaiting-review-after` (7d) | them → nudge |
 | stale              | ⏳    | no activity for stale threshold (default 14d)                        | decide |
 | snoozed            | zZ    | local snooze timestamp in future                                     | hidden |
 
-Notes: "my" = `forge--forge-current-user` / githost user. Degrade
-gracefully per host: if a datum (e.g. CI status, review states) is not
-in the db for a host, the rule yields nil rather than erroring.
+Notes: "my" = `forge--forge-current-user` / githost user. A later
+approval does not by itself resolve another reviewer's changes request, so
+any known CHANGES_REQUESTED review conservatively prevents merge readiness.
+Degrade gracefully per host: if a datum (e.g. CI status, review states) is not
+in the db for a host, the rule yields nil rather than erroring. Forge
+0.5.x currently does not persist review states, mergeability, or CI in its
+local database, so those states remain unavailable rather than being guessed
+from unrelated topic fields.
 
 Urgency score = state weight × age; used to sort the attention queue.
 Order: ready-to-merge first, then blocked (⛔), then stale (⏳).

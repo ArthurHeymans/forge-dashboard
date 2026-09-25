@@ -91,6 +91,8 @@ page that `forge-dashboard-triage' can visit directly."
 
 (defvar forge-dashboard-triage--database nil)
 (defvar forge-dashboard-triage--database-file nil)
+(defvar forge-dashboard-triage--state-cache nil
+  "Optional hash table caching triage state during a dashboard refresh.")
 
 (defun forge-dashboard-triage-open-store (&optional file)
   "Open and initialize the triage store at FILE.
@@ -104,6 +106,8 @@ FILE defaults to `forge-dashboard-triage-file' and may be the special string
     (setq forge-dashboard-triage--database
           (sqlite-open (unless (equal file ":memory:") file))
           forge-dashboard-triage--database-file file)
+    (when (hash-table-p forge-dashboard-triage--state-cache)
+      (clrhash forge-dashboard-triage--state-cache))
     (sqlite-execute
      forge-dashboard-triage--database
      (concat "CREATE TABLE IF NOT EXISTS topic_state ("
@@ -126,6 +130,18 @@ FILE defaults to `forge-dashboard-triage-file' and may be the special string
       forge-dashboard-triage--database
     (forge-dashboard-triage-open-store forge-dashboard-triage-file)))
 
+(defun forge-dashboard-triage--load-state-cache ()
+  "Return a hash table containing all rows in the triage state store."
+  (let ((cache (make-hash-table :test #'equal)))
+    (dolist (row (sqlite-select
+                  (forge-dashboard-triage--store)
+                  "SELECT topic_id,snooze_until,done_updated FROM topic_state"))
+      (puthash (nth 0 row)
+               (list :snooze-until (nth 1 row)
+                     :done-updated (nth 2 row))
+               cache))
+    cache))
+
 (defun forge-dashboard-triage--put (topic-id snooze-until done-updated)
   "Store TOPIC-ID with SNOOZE-UNTIL and DONE-UPDATED."
   (sqlite-execute
@@ -134,16 +150,20 @@ FILE defaults to `forge-dashboard-triage-file' and may be the special string
            "VALUES(?,?,?) ON CONFLICT(topic_id) DO UPDATE SET "
            "snooze_until=excluded.snooze_until, "
            "done_updated=excluded.done_updated")
-   (vector topic-id snooze-until done-updated)))
+   (vector topic-id snooze-until done-updated))
+  (when (hash-table-p forge-dashboard-triage--state-cache)
+    (clrhash forge-dashboard-triage--state-cache)))
 
 (defun forge-dashboard-triage-state (topic-id)
   "Return the stored state plist for TOPIC-ID, or nil."
-  (when-let* ((row (car (sqlite-select
-                         (forge-dashboard-triage--store)
-                         (concat "SELECT snooze_until,done_updated "
-                                 "FROM topic_state WHERE topic_id=?")
-                         (vector topic-id)))))
-    (list :snooze-until (nth 0 row) :done-updated (nth 1 row))))
+  (if (hash-table-p forge-dashboard-triage--state-cache)
+      (gethash topic-id forge-dashboard-triage--state-cache)
+    (when-let* ((row (car (sqlite-select
+                           (forge-dashboard-triage--store)
+                           (concat "SELECT snooze_until,done_updated "
+                                   "FROM topic_state WHERE topic_id=?")
+                           (vector topic-id)))))
+      (list :snooze-until (nth 0 row) :done-updated (nth 1 row)))))
 
 (defun forge-dashboard-triage-snooze (topic-id until)
   "Snooze TOPIC-ID until time UNTIL."
@@ -173,15 +193,18 @@ FILE defaults to `forge-dashboard-triage-file' and may be the special string
   "Classify normalized topic DATA into an attention state.
 Absent host data does not satisfy rules that depend on that datum.  DATA uses
 `:mine', `:owned', `:kind', `:approvals', `:review-states', `:latest-review',
-`:draft',
-`:merge-conflict', `:last-comment-mine', `:status', `:review-requested',
-`:reviewed-by-me', `:activity-age', and `:review-age'."
+`:draft', `:merge-conflict', `:last-comment-mine', `:status',
+`:review-requested', `:reviewed-by-me', `:activity-age', and `:review-age'."
   (let* ((mine (plist-get data :mine))
          (pullreq (eq (plist-get data :kind) 'pullreq))
          (reviews (plist-get data :review-states))
          (latest-review (or (plist-get data :latest-review)
-                            (car (last reviews))))
-         (changes (and reviews (memq 'changes-requested reviews))))
+                            (and (listp reviews)
+                                 (car (last reviews)))))
+         ;; A later approval from another reviewer does not clear an earlier
+         ;; changes request.  Without per-reviewer resolution data, be
+         ;; conservative about declaring a pull request merge-ready.
+         (changes (memq 'changes-requested reviews)))
     (cond
      ((plist-get data :snoozed) 'snoozed)
      ((and mine pullreq (eq latest-review 'changes-requested))
@@ -197,7 +220,7 @@ Absent host data does not satisfy rules that depend on that datum.  DATA uses
      ((and pullreq (or mine (plist-get data :owned))
            (numberp (plist-get data :approvals))
            (> (plist-get data :approvals) 0)
-           reviews (not changes)
+           (consp reviews) (not changes)
            (plist-member data :draft) (not (plist-get data :draft))
            (plist-member data :merge-conflict)
            (not (plist-get data :merge-conflict)))
@@ -279,10 +302,36 @@ entry.  Unknown pages yield no items."
       (forge-dashboard-triage--field review :login)
       (forge-dashboard-triage--slot review 'author)))
 
+(defun forge-dashboard-triage--review-updated (review)
+  "Return REVIEW's submission or update timestamp, if it has one."
+  (or (forge-dashboard-triage--field review :updated)
+      (forge-dashboard-triage--field review :updatedAt)
+      (forge-dashboard-triage--field review :submitted-at)
+      (forge-dashboard-triage--field review :submittedAt)
+      (forge-dashboard-triage--field review :submitted)
+      (forge-dashboard-triage--field review :created)
+      (forge-dashboard-triage--field review :createdAt)
+      (forge-dashboard-triage--slot review 'updated)
+      (forge-dashboard-triage--slot review 'submitted-at)
+      (forge-dashboard-triage--slot review 'submitted)
+      (forge-dashboard-triage--slot review 'created)))
+
+(defun forge-dashboard-triage--latest-review-updated (reviews)
+  "Return the latest timestamp among REVIEWS, if any."
+  (when (listp reviews)
+    (seq-reduce
+     (lambda (latest review)
+       (let ((updated (forge-dashboard-triage--review-updated review)))
+         (if (and updated (or (null latest) (string> updated latest)))
+             updated
+           latest)))
+     reviews nil)))
+
 (defun forge-dashboard-triage--login (assignee)
   "Return login string for ASSIGNEE.
-Handles login strings, raw (id login name …) database rows as stored
-in slots like `review-requests', and EIEIO objects with a login slot."
+Handles login strings, raw (id login name forge-id) rows returned by
+Forge's `forge-sql-cdr' for `review-requests', and EIEIO objects with a
+login slot."
   (or (and (stringp assignee) assignee)
       (and (consp assignee) (stringp (nth 1 assignee)) (nth 1 assignee))
       (forge-dashboard-triage--slot assignee 'login)))
@@ -303,7 +352,9 @@ in slots like `review-requests', and EIEIO objects with a login slot."
                       (forge-dashboard-triage--slot topic 'created)))
          (age (forge-dashboard--age-days updated now))
          (requests (and (forge-pullreq-p topic)
-                        (forge-dashboard-triage--slot topic 'review-requests))))
+                        (forge-dashboard-triage--slot topic 'review-requests)))
+         (review-updated
+          (forge-dashboard-triage--latest-review-updated reviews)))
     (append
      (list :id (forge-dashboard-triage--slot topic 'id)
            :kind (if (forge-pullreq-p topic) 'pullreq 'topic)
@@ -315,20 +366,25 @@ in slots like `review-requests', and EIEIO objects with a login slot."
            :review-states review-states
            :latest-review (car (last review-states))
            :draft (forge-dashboard-triage--slot topic 'draft-p)
-           ;; Forge 0.5.x persists neither mergeability nor CI.  Their absence
-           ;; intentionally prevents readiness while keeping CI out of the gate.
-           :ci nil
+           ;; Forge 0.5.x does not retain review states, mergeability, or CI
+           ;; in its local database.  Leave those values absent rather than
+           ;; guessing from unrelated topic data.
            :status (forge-dashboard-triage--slot topic 'status)
            :review-requested
-           (and me (seq-some (lambda (request)
-                               (equal me (forge-dashboard-triage--login request)))
-                             requests))
+           (and me (listp requests)
+                (seq-some (lambda (request)
+                            (equal me (forge-dashboard-triage--login request)))
+                          requests))
            :reviewed-by-me
-           (and me (seq-some (lambda (review)
-                               (equal me
-                                      (forge-dashboard-triage--review-author review)))
-                             reviews))
-           :activity-age age :review-age age :updated updated
+           (and me (listp reviews)
+                (seq-some (lambda (review)
+                            (equal me
+                                   (forge-dashboard-triage--review-author review)))
+                          reviews))
+           :activity-age age
+           :review-age (and review-updated
+                            (forge-dashboard--age-days review-updated now))
+           :updated updated
            :repo (and repo (ignore-errors (oref repo slug))))
      (when last-post
        (list :last-comment-mine
@@ -548,7 +604,7 @@ in slots like `review-requests', and EIEIO objects with a login slot."
                 (format "State: %s  approvals: %s  CI: %s  last activity: %dd\n\n"
                         (plist-get item :state)
                         (or (plist-get data :approvals) "?")
-                        (pcase ci ('success "✓") ('failed "✗") (_ "?"))
+                        (pcase ci ('success "✓") ('failed "✗") (_ "n/a"))
                         (plist-get item :age))
                 "M merge  RET visit  b browse  c checkout  C nudge\n"
                 "z snooze  d done  x close  SPC skip  q quit\n"
