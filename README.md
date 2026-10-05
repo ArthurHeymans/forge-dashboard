@@ -66,14 +66,18 @@ Clone next to Forge and add both to your `load-path`:
 
 ## Usage
 
-`M-x forge-dashboard` opens the dashboard.
+`M-x forge-dashboard` displays the last successful snapshot immediately and
+refreshes it from the local database in a separate Emacs process. Reopening
+preserves your filters, point, and expanded sections. With no cached data, a
+loading message is shown until the first scan completes. Failed scans leave
+the previous snapshot intact; network pulls remain explicit.
 
 | Key       | Action                                                       |
 |-----------|--------------------------------------------------------------|
 | `RET`     | Visit topic (or list the repository's topics)                |
 | `b`       | Browse topic or repository in a browser                      |
 | `y`       | Copy topic or repository URL                                 |
-| `g` / `G` | Refresh from the local db / pull each dashboard repo         |
+| `g` / `G` | Refresh from the local db in the background / pull dashboard repos |
 | `t`       | Triage the attention queue one item at a time                |
 | `z` / `d` | Snooze topic / mark done until new activity                  |
 | `C`       | Nudge with a pre-filled comment template                     |
@@ -90,6 +94,7 @@ Snooze/done marks are stored in a separate local SQLite file
 
 ## Customization
 
+- `forge-dashboard-cache-file` — last successful snapshot, including private topic data; defaults to `forge-dashboard-cache.el` in `user-emacs-directory`, written with owner-only permissions. Set to `nil` to disable disk caching.
 - `forge-dashboard-organizations` — extra owners counted as member repos.
 - `forge-dashboard-topics-per-repo` — max topics per repo (`nil` = all).
 - `forge-dashboard-stale-after` (14), `forge-dashboard-awaiting-review-after` (7) — day thresholds.

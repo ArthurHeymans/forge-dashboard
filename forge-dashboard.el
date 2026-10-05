@@ -63,6 +63,18 @@ Nil means show every topic.  Repository sections are collapsed by default."
   :type '(choice (const :tag "All" nil) natnum)
   :group 'forge-dashboard)
 
+(defcustom forge-dashboard-cache-file
+  (expand-file-name "forge-dashboard-cache.el" user-emacs-directory)
+  "File holding the last successful local database snapshot.
+Set to nil to disable caching across Emacs sessions.  Database scans still
+run in a separate Emacs process.  This file contains private topic data."
+  :type '(choice (const :tag "No disk cache" nil) file)
+  :group 'forge-dashboard)
+
+(defvar-local forge-dashboard--snapshot nil)
+(defvar-local forge-dashboard--refresh-process nil)
+(defvar-local forge-dashboard--render-only nil)
+
 (defcustom forge-dashboard-stale-after 14
   "Number of days after which a topic is considered stale."
   :type 'natnum
@@ -214,7 +226,7 @@ The returned plist contains no rendered text or buffer state."
          (entry (seq-find
                  (lambda (entry)
                    (and (eq (nth 0 entry) type)
-                        (eq (nth 1 entry) repo)))
+                        (equal (oref (nth 1 entry) id) (oref repo id))))
                  forge-dashboard--repo-data-cache)))
     (or (nth 2 entry)
         (let ((data (forge-dashboard--repo-data repo)))
@@ -285,7 +297,11 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
 
 (defun forge-dashboard--updated-label ()
   "Return a label describing the latest local database update."
-  (if-let* ((updated (forge-dashboard--latest-update)))
+  (forge-dashboard--format-updated-label (forge-dashboard--latest-update)))
+
+(defun forge-dashboard--format-updated-label (updated)
+  "Describe cached UPDATED relative to now, without querying the database."
+  (if updated
       (let ((days (forge-dashboard--age-days updated)))
         (if (zerop days)
             "<1d ago"
@@ -423,7 +439,7 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
   "<remap> <forge-browse-issue>" #'forge-dashboard-browse
   "<remap> <forge-browse-pullreq>" #'forge-dashboard-browse
   "y" #'forge-dashboard-copy-url
-  "g" #'magit-refresh
+  "g" #'forge-dashboard-refresh
   "G" #'forge-dashboard-pull
   "t" #'forge-dashboard-triage
   "z" #'forge-dashboard-snooze
@@ -440,11 +456,13 @@ and ORGS overrides, and whether I am ASSIGNABLE in the repository."
                    "<remap> <forge-browse-issue>"
                    "<remap> <forge-browse-pullreq>"))
   (keymap-set forge-dashboard-mode-map binding #'forge-dashboard-browse))
+(keymap-set forge-dashboard-mode-map "g" #'forge-dashboard-refresh)
 
 (define-derived-mode forge-dashboard-mode magit-mode "Forge Dashboard"
   "Major mode for the Forge dashboard."
   :interactive nil
-  (setq-local forge-buffer-unassociated-p t))
+  (setq-local forge-buffer-unassociated-p t)
+  (add-hook 'kill-buffer-hook #'forge-dashboard--cancel-refresh nil t))
 
 (defun forge-dashboard--attention-items (repos &optional now)
   "Return urgency-sorted attention items for REPOS at NOW."
@@ -552,33 +570,258 @@ Subgroups follow `forge-dashboard-attention-groups'."
             (forge-dashboard--insert-attention-group (car group) (cdr group)))
         (insert "  Nothing needs attention\n")))))
 
+(defun forge-dashboard--collect-snapshot ()
+  "Collect dashboard data synchronously, in the worker Emacs only."
+  (let* ((forge-dashboard-topic-type 'all)
+         (forge-dashboard--repo-data-cache nil)
+         (forge-dashboard--classification-cache (make-hash-table :test #'equal))
+         (repos (forge-dashboard--dashboard-repositories))
+         (attention (forge-dashboard--attention-items repos)))
+    (list :repos repos
+          :classes (mapcar (lambda (repo)
+                             (cons (oref repo id) (forge-dashboard--classify repo)))
+                           repos)
+          :data (mapcar #'forge-dashboard--cached-repo-data repos)
+          :attention attention
+          :updated (forge-dashboard--latest-update))))
+
+(defun forge-dashboard--encode (value)
+  "Convert VALUE to readable data, omitting live Closql connections."
+  (cond
+   ((eieio-object-p value)
+    (list :forge-dashboard-object (eieio-object-class value)
+          (seq-keep
+           (lambda (slot)
+             (let* ((name (eieio-slot-descriptor-name slot))
+                    ;; Do not materialize lazy database-backed slots.
+                    (raw (if (cl-typep value 'closql-object)
+                             (closql--oref value name)
+                           (condition-case nil (slot-value value name)
+                             (unbound-slot eieio--unbound)))))
+               (when (and (not (eq name 'closql-database))
+                          (not (eq raw eieio--unbound)))
+                 (cons name (forge-dashboard--encode raw)))))
+           (eieio-class-slots (eieio-object-class value)))))
+   ((consp value)
+    (cons (forge-dashboard--encode (car value))
+          (forge-dashboard--encode (cdr value))))
+   ((vectorp value) (vconcat (mapcar #'forge-dashboard--encode value)))
+   (t value)))
+
+(defun forge-dashboard--decode (value &optional connection)
+  "Restore VALUE's Forge objects, attaching them to CONNECTION."
+  (cond
+   ((and (consp value) (eq (car value) :forge-dashboard-object))
+    (let ((object (make-instance (nth 1 value))))
+      (dolist (slot (nth 2 value))
+        (setf (slot-value object (car slot))
+              (forge-dashboard--decode (cdr slot) connection)))
+      (when (cl-typep object 'closql-object)
+        (closql--oset object 'closql-database connection))
+      object))
+   ((consp value)
+    (cons (forge-dashboard--decode (car value) connection)
+          (forge-dashboard--decode (cdr value) connection)))
+   ((vectorp value)
+    (vconcat (mapcar (lambda (item) (forge-dashboard--decode item connection))
+                    value)))
+   (t value)))
+
+(defun forge-dashboard--worker-settings ()
+  "Return configuration needed by the worker and identifying disk caches."
+  (mapcar (lambda (variable) (list variable (symbol-value variable)))
+          '(user-emacs-directory forge-database-file forge-owned-accounts
+            forge-dashboard-organizations forge-dashboard-stale-after
+            forge-dashboard-awaiting-review-after forge-dashboard-urgency-weights
+            forge-dashboard-triage-file)))
+
+(defun forge-dashboard--read-snapshot (file settings)
+  "Read a snapshot from FILE if its configuration matches SETTINGS."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (let ((record (read (current-buffer))))
+      (when (and (equal (plist-get record :version) 1)
+                 (equal (plist-get record :settings) settings))
+        (forge-dashboard--decode (plist-get record :snapshot)
+                                 (oref (forge-db) connection))))))
+
+(defun forge-dashboard--worker (file)
+  "Write a fresh, serializable snapshot to FILE in a batch Emacs."
+  (let ((print-length nil) (print-level nil))
+    (with-temp-file file
+      (prin1 (list :version 1 :settings (forge-dashboard--worker-settings)
+                   :snapshot (forge-dashboard--encode
+                              (forge-dashboard--collect-snapshot)))
+             (current-buffer)))))
+
+(defun forge-dashboard--cancel-refresh ()
+  "Cancel this buffer's database scan, if any."
+  (let ((process forge-dashboard--refresh-process))
+    (setq forge-dashboard--refresh-process nil)
+    (when (process-live-p process) (delete-process process))))
+
+(defun forge-dashboard--start-refresh ()
+  "Start one background database scan for the current dashboard."
+  (unless (process-live-p forge-dashboard--refresh-process)
+    (let* ((buffer (current-buffer))
+           (settings (forge-dashboard--worker-settings))
+           (file (make-temp-file "forge-dashboard-"))
+           (log (generate-new-buffer " *forge-dashboard-worker*"))
+           (command
+            (append
+             (list (expand-file-name invocation-name invocation-directory)
+                   "-Q" "--batch")
+             (mapcan (lambda (dir)
+                       (when (and (stringp dir) (not (file-remote-p dir)))
+                         (list "-L" (expand-file-name dir))))
+                     load-path)
+             (list "--eval" "(setq load-prefer-newer t)"
+                   "-l" "forge-dashboard"
+                   "--eval" (prin1-to-string
+                              `(progn ,@(mapcar (pcase-lambda (`(,var ,value))
+                                                  `(setq ,var ',value))
+                                                settings)
+                                      (forge-dashboard--worker ,file)))))))
+      (condition-case err
+          (setq forge-dashboard--refresh-process
+                (make-process
+                 :name "forge-dashboard-refresh" :buffer log
+                 :command command :connection-type 'pipe :noquery t
+                 :sentinel
+                 (lambda (process _event)
+                   (when (memq (process-status process) '(exit signal))
+                     (unwind-protect
+                         (when (buffer-live-p buffer)
+                           (with-current-buffer buffer
+                             (when (eq process forge-dashboard--refresh-process)
+                               (setq forge-dashboard--refresh-process nil)
+                               (condition-case failure
+                                   (progn
+                                     (unless (zerop (process-exit-status process))
+                                       (error "Worker failed: %s"
+                                              (with-current-buffer log
+                                                (buffer-string))))
+                                     ;; Settings may have changed during the scan.
+                                     (if (equal settings
+                                                (forge-dashboard--worker-settings))
+                                       (let ((snapshot
+                                              (forge-dashboard--read-snapshot
+                                               file settings)))
+                                         (unless snapshot (error "Invalid snapshot"))
+                                         (setq forge-dashboard--snapshot snapshot)
+                                         (when forge-dashboard-cache-file
+                                           (condition-case cache-error
+                                               (forge-dashboard--save-cache file)
+                                             (error
+                                              (message "Forge dashboard cache: %s"
+                                                       (error-message-string
+                                                        cache-error)))))
+                                         (let ((forge-dashboard--render-only t))
+                                           (magit-refresh-buffer)))
+                                       (forge-dashboard--start-refresh)))
+                                 (error
+                                  (message "Forge dashboard refresh: %s"
+                                           (error-message-string failure)))))))
+                       (delete-file file)
+                       (kill-buffer log))))))
+        (error
+         (delete-file file)
+         (kill-buffer log)
+         (message "Forge dashboard refresh: %s" (error-message-string err)))))))
+
+(defun forge-dashboard--save-cache (source)
+  "Atomically save the successful snapshot in SOURCE to the cache file."
+  (let* ((target (expand-file-name forge-dashboard-cache-file))
+         (_ (make-directory (file-name-directory target) t))
+         (temp (make-temp-file (concat target "."))))
+    (unwind-protect
+        (progn
+          (copy-file source temp t)
+          (set-file-modes temp #o600)
+          (rename-file temp target t))
+      (when (file-exists-p temp) (delete-file temp)))))
+
+(defun forge-dashboard--visible-attention ()
+  "Return cached attention items, honoring current snooze and done marks."
+  (let ((forge-dashboard-triage--state-cache
+         (forge-dashboard-triage--load-state-cache)))
+    (seq-remove
+     (lambda (item)
+       (let ((data (plist-get item :data)))
+         (or (forge-dashboard-triage-snoozed-p (plist-get data :id))
+             (forge-dashboard-triage-done-p (plist-get data :id)
+                                            (plist-get data :updated)))))
+     (plist-get forge-dashboard--snapshot :attention))))
+
 (defun forge-dashboard-refresh-buffer ()
-  "Render the Forge dashboard from the local database."
-  (let* ((forge-dashboard--repo-data-cache nil)
+  "Render the last snapshot and request a background database scan.
+Magit's refresh machinery preserves point and section visibility."
+  (unless forge-dashboard--render-only (forge-dashboard--start-refresh))
+  (let* ((repos (plist-get forge-dashboard--snapshot :repos))
          (forge-dashboard--classification-cache
           (make-hash-table :test #'equal))
-         (repos (forge-dashboard--tracked-repositories))
-         (dashboard-repos (seq-filter #'forge-dashboard--classify repos))
-         (attention (forge-dashboard--attention-items dashboard-repos)))
+         (forge-dashboard--repo-data-cache
+          (mapcar
+           (lambda (data)
+             (let ((filtered (copy-sequence data)))
+               (plist-put filtered :topics
+                          (seq-filter
+                           (lambda (topic)
+                             (pcase forge-dashboard-topic-type
+                               ('pr (forge-pullreq-p topic))
+                               ('issue (forge-issue-p topic))
+                               (_ t)))
+                           (plist-get data :topics)))
+               (list forge-dashboard-topic-type (plist-get data :repo) filtered)))
+           (plist-get forge-dashboard--snapshot :data))))
+    (dolist (entry (plist-get forge-dashboard--snapshot :classes))
+      (puthash (car entry) (list (cdr entry))
+               forge-dashboard--classification-cache))
     (magit-insert-section (forge-dashboard)
       (insert (propertize "Forge Dashboard"
                           'font-lock-face 'magit-section-heading)
-              (propertize (format "  updated %s\n\n"
-                                  (forge-dashboard--updated-label))
+              (propertize (format "  updated %s%s\n\n"
+                                  (if forge-dashboard--snapshot
+                                      (forge-dashboard--format-updated-label
+                                       (plist-get forge-dashboard--snapshot :updated))
+                                    "unknown")
+                                  (if forge-dashboard--refresh-process
+                                      " (refreshing…)" ""))
                           'font-lock-face 'forge-dimmed))
-      (forge-dashboard--insert-attention attention)
-      (when forge-dashboard-show-owned
-        (forge-dashboard--insert-owned repos))
-      (when forge-dashboard-show-organizations
-        (forge-dashboard--insert-organizations repos)))))
+      (if forge-dashboard--snapshot
+          (progn
+            (forge-dashboard--insert-attention (forge-dashboard--visible-attention))
+            (when forge-dashboard-show-owned (forge-dashboard--insert-owned repos))
+            (when forge-dashboard-show-organizations
+              (forge-dashboard--insert-organizations repos)))
+        (insert "  Loading local Forge data in the background…\n")))))
+
+(defun forge-dashboard-refresh ()
+  "Request a fresh database scan without blocking the dashboard."
+  (interactive)
+  (forge-dashboard--cancel-refresh)
+  (magit-refresh-buffer))
 
 ;;;###autoload
 (defun forge-dashboard ()
-  "Display the Forge dashboard."
+  "Display cached dashboard data immediately, then update in the background.
+Only the local database is scanned; network pulls remain explicit."
   (interactive)
-  (magit-setup-buffer #'forge-dashboard-mode nil
-    :buffer (get-buffer-create "*forge-dashboard*")
-    (forge-buffer-unassociated-p t)))
+  (let ((buffer (get-buffer-create "*forge-dashboard*")))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'forge-dashboard-mode)
+        (forge-dashboard-mode)
+        (when (and forge-dashboard-cache-file
+                   (file-readable-p forge-dashboard-cache-file))
+          (setq forge-dashboard--snapshot
+                (ignore-errors
+                  (forge-dashboard--read-snapshot
+                   forge-dashboard-cache-file (forge-dashboard--worker-settings)))))
+        (let ((forge-dashboard--render-only t)) (magit-refresh-buffer t))))
+    (magit-display-buffer buffer)
+    (with-current-buffer buffer
+      (forge-dashboard--start-refresh))
+    buffer))
 
 (defun forge-dashboard-visit ()
   "Visit the topic or repository at point."
@@ -611,8 +854,7 @@ With a prefix argument, prompt for a triage PAGE (see
                             (forge-dashboard-triage-page-names)
                             nil t nil nil "All"))))
   (forge-dashboard-triage-start
-   (forge-dashboard--attention-items
-    (forge-dashboard--dashboard-repositories))
+   (forge-dashboard--visible-attention)
    (current-buffer) page))
 
 (defun forge-dashboard-copy-url ()
@@ -736,7 +978,7 @@ any supported forge host."
    ["Display"
     ("l" "Per-repo limit" forge-dashboard-set-limit)]
    ["Refresh"
-    ("g" "Local database" magit-refresh)
+    ("g" "Local database" forge-dashboard-refresh)
     ("G" "Pull dashboard repos" forge-dashboard-pull)
     ("A" "Pull all tracked repos" forge-dashboard-pull-all)]])
 
