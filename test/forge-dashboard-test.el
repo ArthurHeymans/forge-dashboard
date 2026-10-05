@@ -715,6 +715,10 @@
                     (deadline (+ (float-time) 15)))
                 (forge-dashboard--start-refresh)
                 (should (eq process forge-dashboard--refresh-process))
+                ;; Magit refresh after a pull must supersede an older scan.
+                (magit-refresh-buffer)
+                (should-not (eq process forge-dashboard--refresh-process))
+                (setq process forge-dashboard--refresh-process)
                 (while (and (process-live-p process) (< (float-time) deadline))
                   (accept-process-output process 0.1))
                 (should-not (process-live-p process))

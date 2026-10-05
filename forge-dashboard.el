@@ -756,7 +756,10 @@ Subgroups follow `forge-dashboard-attention-groups'."
 (defun forge-dashboard-refresh-buffer ()
   "Render the last snapshot and request a background database scan.
 Magit's refresh machinery preserves point and section visibility."
-  (unless forge-dashboard--render-only (forge-dashboard--start-refresh))
+  (unless forge-dashboard--render-only
+    ;; A pull or topic action can invalidate an already-running scan.
+    (forge-dashboard--cancel-refresh)
+    (forge-dashboard--start-refresh))
   (let* ((repos (plist-get forge-dashboard--snapshot :repos))
          (forge-dashboard--classification-cache
           (make-hash-table :test #'equal))
